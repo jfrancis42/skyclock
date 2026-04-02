@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=skyclock
+Comment=WWV time code decoder and clock synchroniser
+Exec=skyclock
+Icon=skyclock
+Type=Application
+Categories=HamRadio;Utility;
+Terminal=true

@@ -1,0 +1,28 @@
+# Build output
+build/
+build-release/
+AppDir/
+*.AppImage
+
+# Audio samples (too large / not redistributable)
+*.opus
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Development / analysis scripts
+*.py
+
+# Test output and shell convenience scripts
+*.log
+*.sh
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
