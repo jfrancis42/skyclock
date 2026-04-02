@@ -12,8 +12,23 @@
  *   Detection strategy:
  *     • 1 kHz Goertzel detects the 5 ms tick (one 10 ms block is enough).
  *       The rising edge marks the precise second boundary.
- *     • 100 Hz Goertzel measures the data-bit pulse that follows.
- *       The pulse duration is classified as ZERO/ONE/MARKER.
+ *     • 100 Hz Goertzel raw power is accumulated into three fixed sub-windows
+ *       after each tick and classified by the ratio of incremental energies:
+ *
+ *       early (30–230 ms): 20 blocks  →  e_early
+ *       mid  (230–530 ms): 30 blocks  →  e_mid
+ *       late (530–830 ms): 30 blocks  →  e_late
+ *
+ *       Classification at 830 ms:
+ *         total = e_early + e_mid + e_late
+ *         if total < SNR_MIN × noise_800 → MISSING
+ *         elif e_late / total > 0.28     → MARKER  (energy persists to 830 ms)
+ *         elif e_mid  / total > 0.28     → ONE     (energy persists to 530 ms)
+ *         else                           → ZERO    (energy ends by 230 ms)
+ *
+ *       This approach accumulates evidence across the full bit period, so HF
+ *       flutter fading (10–70 ms incoherent fragments) sums to the same
+ *       result as a sustained tone of the same total duration.
  *
  * BCD frame layout (60 bits, one per second):
  *   P0  : second 0   (reference marker / start of minute)
@@ -53,6 +68,15 @@ static const int k_markerSecs[] = {0, 9, 19, 29, 39, 49};
 
 /* ── "Always zero" unweighted bit positions ─────────────────────────────── */
 static const int k_zeroSecs[] = {4, 10, 11, 14, 20, 21, 24, 34, 35, 36, 37, 44, 54, 58};
+
+/* ── Classification parameters ───────────────────────────────────────────── */
+// Minimum total-window SNR to produce any bit; below this → MISSING.
+// noise_800 = m_noiseFloor100 × (80 blocks / 6 blocks).
+static constexpr float k_snrMin      = 2.0f;
+// Fraction of total energy in the late or mid sub-window that divides the
+// three bit types.  Derived from Python energy analysis on wwv-noisy.opus.
+static constexpr float k_lateFrac    = 0.28f; // late_frac > this → MARKER
+static constexpr float k_midFrac     = 0.28f; // mid_frac  > this → ONE
 
 /* ── Constructor ─────────────────────────────────────────────────────────── */
 WwvDecoder::WwvDecoder(float sampleRate)
@@ -122,10 +146,16 @@ void WwvDecoder::processBlock(const float* block)
     m_signalLevel = (snr1k > 1.0f) ? (1.0f - 1.0f / snr1k) : 0.0f;
     if (m_signalLevel > 1.0f) m_signalLevel = 1.0f;
 
-    // ── 100 Hz Goertzel — smooth on every block (including warmup) ───────────
+    // ── 100 Hz Goertzel — raw power for accumulation ─────────────────────────
+    float p100 = goertzel(block, m_blockSize, 100.0f, m_sampleRate);
+
+    // Track 100 Hz background for tick anti-spoof gate.
+    // Update downward quickly when p100 is near floor; admit only a trickle
+    // from active-subcarrier blocks so the floor isn't pulled up to signal level.
     {
-        float p100w = goertzel(block, m_blockSize, 100.0f, m_sampleRate);
-        m_smooth100 = 0.5f * p100w + 0.5f * m_smooth100;
+        float ad100bg = (p100 < m_background100 * 3.0f) ? 0.005f : 0.0001f;
+        m_background100 = (1.0f - ad100bg) * m_background100 + ad100bg * p100;
+        if (m_background100 < 1e-12f) m_background100 = 1e-12f;
     }
 
     // Wait for noise floor EMA to converge before attempting detection.
@@ -135,167 +165,86 @@ void WwvDecoder::processBlock(const float* block)
     // The on-time tick is 5 ms — it fits inside a single 10 ms block and rises
     // sharply.  Threshold at 100× noise floor catches even low-SNR ticks while
     // rejecting 100 Hz data-bit leakage (which is at ~0 in the 1 kHz bin).
-    // No debounce for onset — the tick is intentionally brief; we want exactly
-    // one event per second.  A lockout of 10 blocks (100 ms) prevents the same
-    // tick from re-triggering on adjacent blocks.
-    bool tickNow = (p1k > m_noisePower * 100.0f);
-    // Lockout: suppress false re-triggers within 950 ms of the last tick.
-    // Real ticks are exactly 1000 ms apart (atomic clock); any tick within
-    // 950 ms is false — typically 100 Hz MARKER harmonics exciting the 1 kHz
-    // bin, or multi-path echoes.  950 ms is safely below the 1000 ms period
-    // while leaving room for the ±50 ms timing jitter possible in HF recordings.
+    // Lockout of 95 blocks (950 ms) prevents false re-triggers from 100 Hz
+    // MARKER harmonics or multi-path echoes.
+    //
+    // Anti-spoof gate: genuine 1 kHz ticks occur at the very start of each
+    // second, before the 100 Hz subcarrier begins (~30 ms later), so p100 is
+    // near the background floor.  MARKER harmonics (10th harmonic of 100 Hz)
+    // produce elevated p1k AND elevated p100 simultaneously.  Gate on p100 to
+    // reject these false triggers.
+    bool tickNow = (p1k > m_noisePower * 100.0f)
+                && (p100 < m_background100 * 10.0f);
     if (static_cast<int>(m_totalBlocks) - m_lastTickBlock < 95) tickNow = false;
     if (tickNow && !m_tickLastBlock) {
-        // Rising edge: each tick is a hard second boundary.  Force-close any
-        // active data window from the *previous* second so the measurement is
-        // not abandoned silently.  This is the correct path when a MARKER
-        // bit's EMA tail hasn't decayed to thresh_off before the next tick
-        // arrives — the tick itself provides a clean fence.
-        if (m_inDataWindow) {
-            if (m_in100Hz) {
-                int durBlocks = m_totalBlocks - m_data100StartBlock;
-                onPulse(durBlocks, m_dataWindowTickTime);
-                // Reset the 100 Hz EMA to background so the decaying tail of
-                // the just-closed bit does not contaminate the next data window
-                // (which opens only 30 ms later).  Without this, a low
-                // preTick100 from the background guard would cause thresh100_on
-                // to be so low that the EMA decay spike triggers a spurious
-                // short BIT_ZERO, closing the window before the real data bit
-                // is measured.
-                m_smooth100 = m_background100;
-            }
-            m_inDataWindow = false;
-            m_in100Hz      = false;
-            m_debounce100  = 0;
-        }
-        // Capture the pre-tick smooth100 as the per-second threshold reference.
-        // Normally the previous second's data bit has fully decayed before this
-        // tick arrives (EMA τ ≈ 20 ms; shortest inter-bit gap ≥ 150 ms).
-        // Exception: position-marker seconds (P0/P3/P4/P5) sometimes have a
-        // weak 1 kHz tick that is just above the detection threshold AND a 100 Hz
-        // subcarrier onset that coincides with the same 10 ms block.  In that
-        // case smooth100 is already elevated — using it as preTick100 would make
-        // thresh100_on/off too high and cause the MARKER pulse to go undetected.
-        // Guard: if smooth100 is already elevated above the tracked background,
-        // use the background level instead so thresholds stay noise-referenced.
-        m_preTick100 = (m_smooth100 > m_background100 * 5.0f)
-                       ? m_background100 : m_smooth100;
+        // Rising edge: reset energy accumulators for the new second.
+        m_accEarly = 0.0f;
+        m_accMid   = 0.0f;
+        m_accLate  = 0.0f;
+        m_accNoise = 0.0f;
 
-        // Record the new second boundary.
         m_lastTickBlock = m_totalBlocks;
         m_lastTickTime  = blockTime;
     }
     m_tickLastBlock = tickNow;
 
-    // ── 100 Hz background floor — updated only in quiet periods ──────────────
-    // Mirrors the 1 kHz noise-floor EMA; used by the synthetic tick below.
-    // Only moves downward when smooth100 is below 3× current background so that
-    // active data bits (100–1000× above background) never corrupt the estimate.
-    {
-        float ad100bg = 0.01f;
-        if (m_smooth100 < m_background100 * 3.0f)
-            m_background100 = (1.0f - ad100bg) * m_background100 + ad100bg * m_smooth100;
-        else
-            m_background100 = 0.9999f * m_background100 + 0.0001f * m_smooth100;
-        if (m_background100 < 1e-12f) m_background100 = 1e-12f;
-    }
-
-    // ── Synthetic tick: strong 100 Hz onset without a preceding 1 kHz tick ──
-    // WWV position-marker seconds (P0, P3, P4, P5) can have a 1 kHz reference
-    // tick that is 100–165× weaker than the nominal level, falling below the
-    // 100× noise-floor detection threshold.  In that case the 100 Hz subcarrier
-    // rises simultaneously with the weak tick.  Detect the 100 Hz onset as a
-    // fallback second-boundary indicator so the 800 ms MARKER pulse is not lost.
+    // ── Free-running 1-second prediction (primary fallback) ──────────────────
+    // Once a real tick has been detected, advance the second boundary by
+    // exactly 100 blocks (1000 ms) when no real tick fires.  WWV's cesium
+    // clock makes the actual second boundaries accurate to microseconds, so
+    // the predicted position is correct to within audio-clock jitter (~1 ms
+    // per minute for a typical consumer sound card at 50 ppm).
     //
-    // Conditions: no data window already open; at least 950 ms since last tick
-    // (real or synthetic); smooth100 rises above 20× background for ≥2 blocks.
-    // 950 ms matches the 1 kHz tick lockout — prevents SYNTHK from firing on
-    // the same 100 Hz MARKER onset that would trigger a false real tick.
-    if (!m_inDataWindow && !m_in100Hz) {
-        int bstS = m_totalBlocks - m_lastTickBlock;
-        if (bstS >= 95) {
-            if (m_smooth100 > m_background100 * 20.0f) {
-                if (++m_synthDebounce >= 2) {
-                    // Place synthetic tick 2 blocks before this one (the onset).
-                    m_lastTickBlock = m_totalBlocks - 2;
-                    m_lastTickTime  = m_audioEpoch +
-                        std::chrono::milliseconds(
-                            static_cast<long long>(m_lastTickBlock) * 10LL);
-                    // Use the pre-onset background as preTick100 so that
-                    // thresh100_on/off are relative to the true noise floor,
-                    // not the already-elevated smooth100 at this moment.
-                    m_preTick100    = m_background100;
-                    m_synthDebounce = 0;
-                }
-            } else {
-                m_synthDebounce = 0;
-            }
-        } else {
-            m_synthDebounce = 0;
-        }
-    } else {
-        m_synthDebounce = 0;
+    // This replaces SYNTHK for steady-state operation: SYNTHK fires on 100 Hz
+    // onset, which arrives late under flutter fading, shifting the accumulation
+    // windows away from the true second boundary.  The prediction uses the last
+    // confirmed tick as a phase anchor and drifts only with the audio clock.
+    int bat_predict = m_totalBlocks - m_lastTickBlock;
+    if (m_lastTickBlock > 0 && bat_predict == 100 && !tickNow) {
+        // Real tick didn't arrive — advance prediction.
+        m_accEarly = 0.0f;
+        m_accMid   = 0.0f;
+        m_accLate  = 0.0f;
+        m_accNoise = 0.0f;
+
+        m_lastTickBlock = m_totalBlocks;
+        m_lastTickTime  = blockTime;
     }
 
-    // ── Tick-gated data bit detection state machine ───────────────────────────
-    // Detection is restricted to a window [+30 ms, +1150 ms] after each tick
-    // so the high pre-tick 100 Hz background cannot cause false triggers.
-    //
-    // Thresholds are set relative to m_preTick100 (smooth100 at last tick):
-    //   background within window ≈ m_preTick100; data bits ≈ 10–1000×.
-    // thresh_on at 8× leaves comfortable margin above background fluctuations
-    // while being reachable even for moderate flutter-faded bits.
-    // thresh_off at 3× lets the EMA tail decay past the offset threshold
-    // within ~40 ms of the bit ending (≈ 4 EMA time-constants of 10 ms each).
-    float thresh100_on  = m_preTick100 * 8.0f;
-    float thresh100_off = m_preTick100 * 3.0f;
+    // Note: SYNTHK (100 Hz onset detection for initial lock) is intentionally
+    // omitted.  In flutter-faded HF conditions the first detectable 100 Hz
+    // fragment may arrive 200–500 ms after the true second boundary; using it
+    // as the phase origin shifts every subsequent prediction by that offset,
+    // causing ZERO bits (30–230 ms window) to be entirely missed.  Waiting for
+    // the first real 1 kHz tick is slower to acquire but produces an accurate
+    // phase reference that the free-running prediction then extrapolates correctly.
 
-    // Manage data window open/close based on the most-recent tick.
-    if (m_lastTickBlock > 0) {
-        int bst = m_totalBlocks - m_lastTickBlock; // blocks since tick
-        if (!m_inDataWindow && !m_in100Hz && bst >= 3 && bst <= 115
-                && m_lastTickBlock != m_dataWindowTick) {
-            m_inDataWindow       = true;
-            m_dataWindowEnd      = m_lastTickBlock + 115;  // 1150 ms: 800ms MARKER + EMA decay room
-            m_dataWindowTick     = m_lastTickBlock;
-            m_dataWindowTickTime = m_lastTickTime;         // snapshot tick time at window open
-        }
-        if (m_inDataWindow && m_totalBlocks > m_dataWindowEnd) {
-            // Window expired — if a bit was in progress, close it.
-            if (m_in100Hz) {
-                int durBlocks = m_dataWindowEnd - m_data100StartBlock;
-                onPulse(durBlocks, m_dataWindowTickTime);
-                m_in100Hz     = false;
-                m_debounce100 = 0;
-            }
-            m_inDataWindow = false;
-        }
+    // ── Energy accumulation into sub-windows ─────────────────────────────────
+    // bat = blocks after tick.  Each block's raw 100 Hz Goertzel power is added
+    // to the appropriate window.  Raw power (not the EMA) accumulates correctly
+    // from incoherent flutter fragments — brief bursts simply add their energy
+    // to whichever window they land in.
+    int bat = m_totalBlocks - m_lastTickBlock;
+
+    if      (bat >= 3  && bat <= 22) m_accEarly += p100;
+    else if (bat >= 23 && bat <= 52) m_accMid   += p100;
+    else if (bat >= 53 && bat <= 82) m_accLate  += p100;
+    else if (bat >= 92 && bat <= 97) m_accNoise += p100;
+
+    // ── Classify at 830 ms ───────────────────────────────────────────────────
+    if (bat == 83) {
+        onWindowClose(m_lastTickTime);
     }
 
-    if (m_inDataWindow) {
-        if (!m_in100Hz) {
-            if (m_smooth100 > thresh100_on) {
-                if (++m_debounce100 >= 2) { // 20 ms onset confirmation
-                    m_in100Hz           = true;
-                    m_debounce100       = 0;
-                    m_data100StartBlock = m_totalBlocks - 2;
-                }
-            } else {
-                m_debounce100 = 0;
-            }
-        } else {
-            if (m_smooth100 < thresh100_off) {
-                if (++m_debounce100 >= 5) { // 50 ms offset confirmation — prevents brief dips from closing MARKER windows
-                    m_in100Hz      = false;
-                    m_debounce100  = 0;
-                    m_inDataWindow = false;
-                    int durBlocks  = (m_totalBlocks - 5) - m_data100StartBlock;
-                    onPulse(durBlocks, m_dataWindowTickTime);
-                }
-            } else {
-                m_debounce100 = 0;
-            }
-        }
+    // ── Update noise floor at end of noise tail window ───────────────────────
+    // At bat == 98 (980 ms) the 6-block noise measurement is complete.
+    // Update the rolling EMA.  α = 0.1 gives ~10 second settling time.
+    if (bat == 98) {
+        const float noiseAlpha = 0.1f;
+        m_noiseFloor100 = (1.0f - noiseAlpha) * m_noiseFloor100
+                        + noiseAlpha * m_accNoise;
+        if (m_noiseFloor100 < 1e-12f) m_noiseFloor100 = 1e-12f;
+        m_accNoise = 0.0f;
     }
 }
 
@@ -308,50 +257,57 @@ void WwvDecoder::appendBit(int type, std::chrono::steady_clock::time_point t)
     ++m_bitCount;
 }
 
-/* ── onPulse ─────────────────────────────────────────────────────────────── */
-void WwvDecoder::onPulse(int durationBlocks,
-                          std::chrono::steady_clock::time_point pulseStart)
+/* ── onWindowClose ───────────────────────────────────────────────────────── */
+void WwvDecoder::onWindowClose(std::chrono::steady_clock::time_point tickTime)
 {
-    // 10 ms per block
-    int ms = durationBlocks * 10;
+    // Classify the accumulated sub-window energies.
+    float e_early = m_accEarly;   // 30–230 ms (20 blocks)
+    float e_mid   = m_accMid;     // 230–530 ms (30 blocks)
+    float e_late  = m_accLate;    // 530–830 ms (30 blocks)
+    float e_total = e_early + e_mid + e_late;
 
-    // Classify the pulse duration.  Nominal widths: 200 ms (0), 500 ms (1), 800 ms (marker).
-    // Lower minimum reduced from 150 ms to 80 ms to handle HF flutter-fading, where
-    // multi-path interference breaks a sustained tone into brief high-power bursts; the
-    // EMA tail and 150 ms fall-debounce mean even a heavy faded 200 ms pulse can measure
-    // as short as 110 ms.  Upper bound for MARKER raised to 1100 ms for the same reason.
+    // Noise reference: scale the 6-block tail measurement to an 80-block window.
+    float noise_800 = m_noiseFloor100 * (80.0f / 6.0f);
+    float snr_total = (noise_800 > 1e-12f) ? (e_total / noise_800) : 0.0f;
+
     int type;
-    if      (ms >=  80 && ms < 350) type = BIT_ZERO;
-    else if (ms >= 350 && ms < 650) type = BIT_ONE;
-    else if (ms >= 650 && ms < 1100) type = BIT_MARKER;
-    else return; // not a valid WWV pulse
+    if (snr_total < k_snrMin) {
+        type = BIT_MISSING;
+    } else {
+        float late_frac = e_late / e_total;
+        float mid_frac  = e_mid  / e_total;
 
+        if      (late_frac > k_lateFrac) type = BIT_MARKER;
+        else if (mid_frac  > k_midFrac)  type = BIT_ONE;
+        else                             type = BIT_ZERO;
+    }
+
+    // Approximate nominal duration for the bit callback.
+    int ms = (type == BIT_ZERO)   ? 200 :
+             (type == BIT_ONE)    ? 500 :
+             (type == BIT_MARKER) ? 800 : 0;
+
+    // ── Gap-fill: insert BIT_MISSING placeholders for skipped seconds ─────────
     if (m_bitCount > 0) {
         int prevIdx = (m_bitHead - 1 + k_bufSize) % k_bufSize;
         auto prevTime = m_bitTimes[prevIdx];
-        double gapSec = std::chrono::duration<double>(pulseStart - prevTime).count();
+        double gapSec = std::chrono::duration<double>(tickTime - prevTime).count();
 
-        // Deduplication: if the previous bit fired less than 600 ms ago, this is
-        // a second burst within the same second (flutter fading broke the pulse into
-        // multiple clusters).  Keep whichever bit has the longer/more-reliable type
-        // (prefer MARKER > ONE > ZERO) and discard the other.
-        if (gapSec < 0.600) {
+        // Dedup: if the previous bit fired less than 600 ms ago, something
+        // fired twice for the same second (e.g. SYNTHK then real tick).
+        // Keep whichever bit has the higher-priority type (MARKER > ONE > ZERO).
+        if (gapSec < 0.600 && type != BIT_MISSING) {
             int prevType = m_bits[prevIdx];
             if (type > prevType) {
-                // New bit is "higher priority" — replace the previous one.
-                m_bits[prevIdx] = type;
-                m_bitTimes[prevIdx] = pulseStart;
+                m_bits[prevIdx]     = type;
+                m_bitTimes[prevIdx] = tickTime;
             }
-            // Either way, don't add a second ring-buffer entry for this second.
             if (m_bitCb) m_bitCb(type, ms);
             return;
         }
 
-        // Gap-fill: if more than 1.5 s has elapsed since the last detected bit,
-        // one or more seconds were missed (HF fading dropout).  Insert BIT_MISSING
-        // placeholders so the ring buffer retains the correct 1-second cadence and
-        // trySyncAndDecode() can still find a valid 60-bit frame when only isolated
-        // seconds are lost.  Cap at 20 so a long silence doesn't flood the buffer.
+        // Gap-fill: more than 1.5 s since last bit → insert placeholders.
+        // Cap at 20 so a long silence doesn't flood the buffer.
         int missed = static_cast<int>(std::round(gapSec)) - 1;
         if (missed > 0 && missed <= 20) {
             for (int i = 0; i < missed; ++i) {
@@ -363,10 +319,10 @@ void WwvDecoder::onPulse(int durationBlocks,
         }
     }
 
-    appendBit(type, pulseStart);
+    appendBit(type, tickTime);
     if (m_bitCb) m_bitCb(type, ms);
 
-    // Once we have at least 60 bits, attempt frame sync
+    // Once we have at least 60 bits, attempt frame sync.
     if (m_bitCount >= 60)
         trySyncAndDecode();
 }

@@ -7,9 +7,8 @@ input), decodes the BCD time code from audio in real time, displays current UTC,
 optionally sets the system clock once a configurable number of consecutive frames have
 been verified.
 
-**Status: early alpha.** Decodes reliably from clean recordings and live reception
-under good propagation. Fails on signals with heavy HF flutter fading (see [Known
-Limitations](#known-limitations)).
+**Status: early alpha.** Decodes reliably from clean recordings, live reception under
+good propagation, and HF signals degraded by severe flutter fading.
 
 ---
 
@@ -23,7 +22,6 @@ Limitations](#known-limitations)).
 6. [Reading audio files (ffmpeg)](#reading-audio-files-ffmpeg)
 7. [What works](#what-works)
 8. [Known limitations](#known-limitations)
-9. [Future work](#future-work)
 
 ---
 
@@ -45,17 +43,17 @@ decoder for frame alignment.
 
 The BCD fields encoded in the 60 bits are (by second within the frame):
 
-| Bits      | Field                        |
-|-----------|------------------------------|
+| Bits      | Field                          |
+|-----------|--------------------------------|
 | 1–8       | Minutes (BCD, tens then units) |
-| 10–18     | Hours (BCD)                  |
-| 20–28     | Day of year (hundreds)       |
-| 25–33     | Day of year (tens + units)   |
-| 38, 40–43 | UT1 correction (±0.1 s steps) |
-| 45–48     | Year tens (BCD)              |
-| 50–53     | Year units (BCD)             |
-| 55–56     | DST status                   |
-| 57        | Leap-second warning          |
+| 10–18     | Hours (BCD)                    |
+| 20–28     | Day of year (hundreds)         |
+| 25–33     | Day of year (tens + units)     |
+| 38, 40–43 | UT1 correction (±0.1 s steps)  |
+| 45–48     | Year tens (BCD)                |
+| 50–53     | Year units (BCD)               |
+| 55–56     | DST status                     |
+| 57        | Leap-second warning            |
 
 See [NIST SP 432](https://www.nist.gov/system/files/documents/2017/04/28/SP-432-NIST-Time-and-Frequency-Services-2012-02-13.pdf) for the complete specification.
 
@@ -74,42 +72,55 @@ overhead of a full FFT.
 
 Each 10 ms block's 1 kHz Goertzel power is smoothed with an exponential moving
 average. A rising edge that exceeds 100× the tracked noise floor is classified as a
-tick (the on-time second marker). A 950 ms lockout after each tick prevents false
-re-triggers from MARKER harmonics or multipath echoes.
+tick (the on-time second marker), subject to an anti-spoof gate: genuine 1 kHz ticks
+occur before the 100 Hz subcarrier begins (~30 ms later), so the 100 Hz Goertzel
+power at tick time is near the background floor. MARKER-subcarrier harmonics at 1 kHz
+(10th harmonic of 100 Hz) are rejected because they occur simultaneously with elevated
+100 Hz power. A 950 ms lockout after each tick also prevents false re-triggers from
+multipath echoes.
 
-If the 1 kHz tick at a particular second is too weak to cross threshold (common on
-position-marker seconds where the signal structure differs), the decoder falls back to
-a **synthetic tick**: it detects a sharp onset of the 100 Hz subcarrier rising more than
-20× above the background noise floor and treats that onset as the second boundary.
+Once a real tick is detected, subsequent second boundaries are **free-running
+predictions**: the decoder advances the phase by exactly 100 blocks (1000 ms) each
+second regardless of whether a real tick arrives. WWV's cesium clock is accurate to
+microseconds; the audio clock drifts less than 1 ms per minute at 50 ppm, so
+predictions remain accurate across many missed ticks.
 
-### 100 Hz data-bit detection
+### 100 Hz data-bit classification via energy integration
 
-After each tick (real or synthetic), a 1 150 ms data window opens. Inside the window
-the decoder tracks an exponential moving average of 100 Hz Goertzel power and looks
-for:
+Rather than detecting a continuous burst onset/offset, the decoder **accumulates raw
+100 Hz Goertzel power** across three fixed sub-windows after each tick:
 
-- **Onset**: `smooth100` rises above `preTick100 × 8` for two consecutive 10 ms
-  blocks.  `preTick100` is the 100 Hz level captured at tick time, giving a per-second
-  noise reference that automatically adapts to varying conditions.
-- **Offset**: `smooth100` falls below `preTick100 × 3` for five consecutive blocks
-  (50 ms confirmation debounce prevents brief signal dips from prematurely closing a
-  MARKER measurement).
+| Window | Blocks after tick | Audio time | Blocks |
+|--------|-------------------|------------|--------|
+| Early  | 3–22              | 30–230 ms  | 20     |
+| Mid    | 23–52             | 230–530 ms | 30     |
+| Late   | 53–82             | 530–830 ms | 30     |
 
-The measured pulse duration classifies the bit:
+Classification fires at block 83 (830 ms post-tick):
 
 ```
- 80–349 ms → BIT_ZERO
-350–649 ms → BIT_ONE
-650–1099 ms → BIT_MARKER
+total = e_early + e_mid + e_late
+
+if total < 2.0 × noise_ref   → BIT_MISSING  (no detectable signal)
+elif e_late / total > 0.28   → BIT_MARKER   (energy extends to 830 ms)
+elif e_mid  / total > 0.28   → BIT_ONE      (energy extends to 530 ms)
+else                         → BIT_ZERO     (energy confined to 230 ms)
 ```
+
+The noise reference is a rolling EMA of the 100 Hz power measured in a quiet tail
+window at 920–970 ms after each tick, scaled to the 80-block measurement span.
+
+This approach is robust to **HF flutter fading**: when the subcarrier arrives as
+10–70 ms incoherent fragments rather than a sustained burst, the fragments still
+deposit energy into the correct sub-window. Brief gaps between fragments do not reset
+the accumulator, so the full bit period contributes to the classification.
 
 ### Ring buffer and gap-fill
 
 Decoded bits are written into a 120-entry ring buffer (two minutes of history). When
 a second is skipped due to HF fading, a `BIT_MISSING` placeholder is inserted so the
 ring buffer keeps correct 1-second cadence. The frame decoder tolerates up to 30
-missing bits per frame and up to one missing *marker* position (HF dropouts on P0 are
-common in real recordings).
+missing bits per frame and up to one missing *marker* position.
 
 ### Frame sync and BCD decode
 
@@ -222,88 +233,50 @@ float32 on the fly. ffmpeg must be installed and in `PATH`:
 sudo apt install ffmpeg
 ```
 
-Any sample rate and channel count is accepted; ffmpeg resamples internally. The decoder
-itself always operates at whatever sample rate the audio arrives at (48 kHz in file
-mode, the device native rate in live mode).
-
 ---
 
 ## What works
 
-- **Clean recordings and strong live signals** decode reliably within 1–2 minutes.
-  The decoder reaches a stable time display with confidence climbing each frame.
-- **Position-marker seconds with weak 1 kHz ticks** are handled via the synthetic
-  tick fallback, so MARKER bits at P0/P3/P4/P5 are still captured.
+- **Clean recordings and strong live signals** decode within 1–2 minutes of
+  accumulated bits.
+- **HF flutter fading** — signals that arrive as 10–70 ms incoherent fragments due to
+  severe ionospheric fading — are handled by the energy integration classifier. Each
+  fragment deposits its 100 Hz energy into the correct sub-window; the total still
+  classifies the bit correctly even when no individual fragment is long enough to
+  trigger a threshold-based detector.
 - **Isolated HF dropouts** (single missed seconds) are filled with `BIT_MISSING`
   placeholders; the frame decoder tolerates up to 30 per frame and 1 missing marker
-  position, so moderate fading does not prevent a decode.
-- **False ticks** from 100 Hz MARKER harmonics at 820–880 ms after a real tick are
-  suppressed by a 950 ms lockout.
-- **Brief signal dips** within a MARKER pulse (common multipath artefact) are
-  bridged by a 50 ms offset debounce.
+  position.
+- **False ticks** from 100 Hz MARKER harmonics are rejected by the anti-spoof gate:
+  genuine ticks have near-floor p100 (subcarrier hasn't started yet); harmonic false
+  triggers have simultaneous elevated p100 and p1k. The 950 ms lockout provides
+  additional protection.
 
 ---
 
 ## Known limitations
 
-### Heavy HF flutter fading (wwv-noisy.opus and similar)
-
-Under severe HF flutter fading conditions the 100 Hz subcarrier arrives as a rapid
-sequence of 10–70 ms fragments rather than a single continuous burst. The current
-threshold-based burst detector requires a *continuous* pulse of at least 80 ms and
-cannot accumulate evidence across gaps, so almost all data bits are reported as
-`BIT_MISSING`.
-
-This is not an edge-case tuning issue — it is a fundamental architectural limitation:
-the detector asks "is there a continuous burst right now?" when the correct question
-under flutter is "has enough 100 Hz energy arrived in this 200/500/800 ms window?"
-
 ### P0 dropout
 
-In some recordings the 1 kHz tick and/or the 100 Hz subcarrier at second 0 of each
-minute (P0) is too weak to detect. The decoder handles a single missing marker per
-frame, but if P0 is consistently absent across multiple minutes, cross-minute
-confidence cannot build through the P0 position.
+In some recordings the 1 kHz tick at second 0 of each minute (P0) is too weak to
+detect. The decoder allows one missing marker per frame, but confidence cannot build
+through P0 if it is consistently absent. Future work: infer P0 from the established
+P1–P5 inter-marker interval.
 
----
+### WWVH / overlapping transmissions
 
-## Future work
+WWVH (Hawaii) transmits on the same frequencies as WWV. Both stations are receivable
+across much of North America on 10 and 15 MHz. The decoder does not distinguish
+between them; mixed reception can produce garbled frames. Tuning to 5 MHz (WWV only)
+typically gives the cleanest single-station decode.
 
-### Energy integration for flutter-faded signals (highest priority)
+### Linux only (for now)
 
-Replace the continuous-burst detector with an **energy integrator**:
+The code compiles on Linux. Windows support is structurally present (PortAudio is
+cross-platform; clock-setting code is conditionally compiled), but has not been tested
+on a live Windows system. Cross-compile toolchain files are included in the repository.
 
-Instead of detecting a sustained onset/offset edge pair, accumulate the 100 Hz
-Goertzel power across the entire post-tick data window and compare against sub-window
-integrals:
+### Hamlib integration untested end-to-end
 
-- Integrate `smooth100` over `[30 ms, 230 ms]` → ZERO-window energy
-- Integrate over `[30 ms, 530 ms]` → ONE-window energy
-- Integrate over `[30 ms, 830 ms]` → MARKER-window energy
-
-Classify the bit by which window's accumulated energy exceeds the expected noise-only
-energy (= `background100 × window_duration`) by the largest margin. This approach is
-insensitive to brief fades mid-pulse because it accumulates evidence rather than
-requiring continuity.
-
-The per-second tick-gated window structure stays the same; only the within-window
-classification logic changes.
-
-### Improved P0 recovery
-
-Track the inter-marker interval precisely: once P1–P5 are established, P0 can be
-inferred to within ±10 ms from the known 60 s frame period. Synthesize a P0 timestamp
-from this estimate rather than requiring a detected signal at exactly second 0.
-
-### Cross-frequency diversity
-
-When two WWV frequencies are received simultaneously (e.g., 5 MHz and 10 MHz via two
-radios or a dual-band receiver), combine their bit streams. A bit confirmed on both
-paths can be trusted with much higher confidence; a bit that disagrees or is missing
-on one path can be taken from the other. This would make the decoder significantly more
-robust under selective HF fading.
-
-### Hamlib integration testing
-
-The hamlib rig-control path exists in the code but has not been tested end-to-end with
-a physical radio. Contributions of tested rig configurations are welcome.
+The hamlib rig-control path exists in the code but has not been exercised with a
+physical radio. Contributions of tested rig configurations are welcome.
