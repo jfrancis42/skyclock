@@ -56,6 +56,17 @@ public:
     // Returns 0 if not yet synced.
     time_t currentUtc() const;
 
+    // Estimate of current UTC with sub-second precision.
+    // Returns the epoch if not yet synced.
+    std::chrono::system_clock::time_point currentUtcPoint() const;
+
+    // Compensate for audio pipeline latency (PortAudio inputLatency, in seconds).
+    // Call once after Pa_OpenStream with Pa_GetStreamInfo(stream)->inputLatency.
+    // Shifts m_audioEpoch backward so that audio timestamps reflect when sound
+    // actually entered the microphone rather than when samples arrived in the
+    // callback.
+    void setAudioLatency(double latencySeconds);
+
     // Most recently decoded frame.
     WwvTime lastFrame() const;
 

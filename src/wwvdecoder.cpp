@@ -441,19 +441,16 @@ bool WwvDecoder::decodeFrame(int startOffset)
     return true;
 }
 
-/* ── currentUtc ──────────────────────────────────────────────────────────── */
-time_t WwvDecoder::currentUtc() const
+/* ── p0UnixTime (internal helper) ────────────────────────────────────────── */
+// Returns the UNIX timestamp of P0 (second 0 of the most recently decoded
+// minute) from the BCD fields in m_frame.
+static time_t p0UnixTime(const WwvTime& frame)
 {
-    if (!m_p0Valid || !m_frame.valid) return 0;
+    int year = 2000 + frame.year2digit;
+    int doy  = frame.dayOfYear;
+    int hour = frame.hour;
+    int min  = frame.minute;
 
-    // Convert decoded minute (year/doy/hour/minute) to UNIX timestamp
-    // P0 is at second 0 of the decoded minute.
-    int year = 2000 + m_frame.year2digit;
-    int doy  = m_frame.dayOfYear;
-    int hour = m_frame.hour;
-    int min  = m_frame.minute;
-
-    // Day-of-year → month/day
     static const int days_norm[] = {31,28,31,30,31,30,31,31,30,31,30,31};
     static const int days_leap[] = {31,29,31,30,31,30,31,31,30,31,30,31};
     bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
@@ -465,28 +462,62 @@ time_t WwvDecoder::currentUtc() const
     }
 
     struct tm t = {};
-    t.tm_year = year - 1900;
-    t.tm_mon  = month - 1;
-    t.tm_mday = day;
-    t.tm_hour = hour;
-    t.tm_min  = min;
-    t.tm_sec  = 0;
+    t.tm_year  = year - 1900;
+    t.tm_mon   = month - 1;
+    t.tm_mday  = day;
+    t.tm_hour  = hour;
+    t.tm_min   = min;
+    t.tm_sec   = 0;
     t.tm_isdst = 0;
 
 #ifdef _WIN32
-    time_t p0_unix = _mkgmtime(&t);
+    return _mkgmtime(&t);
 #else
-    time_t p0_unix = timegm(&t);
+    return timegm(&t);
 #endif
+}
 
-    // Add elapsed audio-time seconds since P0.
-    // m_p0Time and current audio time are both derived from m_audioEpoch + block
-    // count, so this works correctly for both file and live-audio modes.
+/* ── currentUtc ──────────────────────────────────────────────────────────── */
+time_t WwvDecoder::currentUtc() const
+{
+    if (!m_p0Valid || !m_frame.valid) return 0;
+
     auto currentAudioTime = m_audioEpoch +
         std::chrono::milliseconds(static_cast<long long>(m_totalBlocks) * 10LL);
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         currentAudioTime - m_p0Time);
-    return p0_unix + elapsed.count();
+    return p0UnixTime(m_frame) + elapsed.count();
+}
+
+/* ── currentUtcPoint ─────────────────────────────────────────────────────── */
+std::chrono::system_clock::time_point WwvDecoder::currentUtcPoint() const
+{
+    if (!m_p0Valid || !m_frame.valid)
+        return std::chrono::system_clock::time_point{};
+
+    // P0 as a system_clock time_point (whole-second resolution from BCD, which
+    // is fine — P0 is always at the start of a UTC minute, no sub-second part).
+    auto p0 = std::chrono::system_clock::from_time_t(p0UnixTime(m_frame));
+
+    // Audio-time elapsed since P0, at full steady_clock precision (nanoseconds
+    // on most platforms; at worst microseconds).  This carries the sub-second
+    // component that currentUtc() discards.
+    auto currentAudioTime = m_audioEpoch +
+        std::chrono::milliseconds(static_cast<long long>(m_totalBlocks) * 10LL);
+    auto elapsed = currentAudioTime - m_p0Time;
+
+    return p0 + std::chrono::duration_cast<std::chrono::system_clock::duration>(elapsed);
+}
+
+/* ── setAudioLatency ─────────────────────────────────────────────────────── */
+void WwvDecoder::setAudioLatency(double latencySeconds)
+{
+    // Shift the audio epoch backward by the pipeline latency so that all
+    // block timestamps reflect when sound entered the microphone rather than
+    // when the samples arrived in the callback.
+    auto correction = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(latencySeconds));
+    m_audioEpoch -= correction;
 }
 
 /* ── lastFrame ───────────────────────────────────────────────────────────── */

@@ -270,7 +270,7 @@ int main(int argc, char* argv[])
                 if (cfg.setSystemClock && !clockSet &&
                     f.confidence >= cfg.minConfidence) {
                     std::string clockErr;
-                    if (setSystemClock(utc, clockErr)) {
+                    if (setSystemClock(decoder.currentUtcPoint(), clockErr)) {
                         printf("\nClock set to %lld UTC\n", (long long)utc);
                         clockSet = true;
                     } else {
@@ -392,6 +392,17 @@ int main(int argc, char* argv[])
     if (err != paNoError) {
         fprintf(stderr, "Pa_OpenStream failed: %s\n", Pa_GetErrorText(err));
         Pa_Terminate(); return 1;
+    }
+
+    // Compensate for audio pipeline latency.  Pa_GetStreamInfo reports the
+    // actual input latency after the stream is opened; this includes the ADC
+    // hardware buffer, OS driver buffer, and the PortAudio layer.  Shifting
+    // the audio epoch backward by this amount aligns decoder timestamps with
+    // when sound actually entered the microphone rather than when samples
+    // arrived in the callback.
+    if (const PaStreamInfo* si = Pa_GetStreamInfo(stream)) {
+        decoder.setAudioLatency(si->inputLatency);
+        printf("Audio latency: %.1f ms (compensated)\n", si->inputLatency * 1000.0);
     }
 
     signal(SIGINT,  on_signal);
