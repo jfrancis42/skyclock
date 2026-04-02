@@ -5,6 +5,9 @@
 #include <map>
 #include <sstream>
 #include <sys/stat.h>
+#ifdef _WIN32
+#  include <direct.h>
+#endif
 
 /* ── Minimal flat JSON parser ────────────────────────────────────────────────
  * Handles: { "key": "string"|number|true|false }
