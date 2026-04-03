@@ -91,12 +91,15 @@ static void appendBitDisplay(int type)
     ++g_bitPos;
 }
 
-// Print a 20-char signal-strength bar using Unicode block elements and ANSI colour.
-static void printBar(float sig)
+// Print a 20-char bar coloured by SNR: red < 3 dB, yellow 3–10 dB, green ≥ 10 dB.
+static void printBar(float sig, float snrDb)
 {
     int filled = (int)(sig * 20.0f + 0.5f);
     if (filled > 20) filled = 20;
-    if (filled > 0) printf("\033[32m");   // green for filled portion
+    const char* color = (snrDb >= 10.0f) ? "\033[32m" :  // green  — good
+                        (snrDb >=  3.0f) ? "\033[33m" :  // yellow — marginal
+                                           "\033[31m";   // red    — poor
+    if (filled > 0) printf("%s", color);
     for (int i = 0; i < filled; ++i)
         printf("\xe2\x96\x88");           // █
     printf("\033[2m");                    // dim for empty portion
@@ -115,9 +118,9 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
         printf("\033[%dA\r", kDisplayLines);
 
     // Line 1 — title, signal bar, frequency
-    printf("\033[1mskyclock " SC_VERSION "\033[0m   ");
-    printBar(sig);
     float snrDb = (sig < 0.9999f) ? -10.0f * log10f(1.0f - sig) : 30.0f;
+    printf("\033[1mskyclock " SC_VERSION "\033[0m   ");
+    printBar(sig, snrDb);
     printf(" SNR:%4.1f dB   %lld kHz\033[K\n", snrDb, freqKhz);
 
     // Line 2 — bit stream (searching) or decoded UTC time (locked)
