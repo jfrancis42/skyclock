@@ -71,15 +71,16 @@ static bool        g_frameUpdated = false;
 // Sliding window of the last 60 classified bits as printable chars.
 // Written only by the audio-thread bit callback; memmove of 59 bytes and
 // single char writes are safe without a mutex on all supported platforms.
-static char g_bitRow[61];      // display chars (., #, |, ?) + NUL; space-padded
-static int  g_bitPos = 0;      // total bits appended (for count label)
+static char  g_bitRow[61];     // display chars (0, 1, |, ?) + NUL; space-padded
+static int   g_bitPos = 0;     // total bits appended (for count label)
+static float g_smoothSig = 0.0f; // slow EMA of signal level (~3 s time constant)
 
 static constexpr int kDisplayLines = 3;
 
 // Append one classified bit to the sliding display window.
 static void appendBitDisplay(int type)
 {
-    char c = (type == 0) ? '.' : (type == 1) ? '#' : (type == 2) ? '|' : '?';
+    char c = (type == 0) ? '0' : (type == 1) ? '1' : (type == 2) ? '|' : '?';
     if (g_bitPos < 60) {
         g_bitRow[g_bitPos] = c;
     } else {
@@ -282,8 +283,8 @@ int main(int argc, char* argv[])
         bool needNewline = false;
         decoder.setBitCallback([&needNewline](int type, int ms) {
             if (needNewline) { printf("\n"); needNewline = false; }
-            if (type == 0)      printf(".(%d) ", ms);
-            else if (type == 1) printf("#(%d) ", ms);
+            if (type == 0)      printf("0(%d) ", ms);
+            else if (type == 1) printf("1(%d) ", ms);
             else if (type == 2) printf("|  (%d ms)\n", ms);
             else                printf("? ");
             fflush(stdout);
@@ -408,8 +409,9 @@ int main(int argc, char* argv[])
             time_t utc = decoder.currentUtc();
             float  sig = decoder.signalLevel();
             WwvTime f  = decoder.lastFrame();
+            g_smoothSig = 0.94f * g_smoothSig + 0.06f * sig;
 
-            drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+            drawDisplay(false, g_smoothSig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
 
             if (cfg.setSystemClock && !clockSet && utc != 0 &&
                 f.confidence >= cfg.minConfidence) {
@@ -419,7 +421,7 @@ int main(int argc, char* argv[])
                 else
                     fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
                 // Redraw immediately to show updated status
-                drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+                drawDisplay(false, g_smoothSig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
             }
         }
 
@@ -557,8 +559,9 @@ int main(int argc, char* argv[])
         time_t  utc = decoder.currentUtc();
         float   sig = decoder.signalLevel();
         WwvTime f   = decoder.lastFrame();
+        g_smoothSig = 0.94f * g_smoothSig + 0.06f * sig;
 
-        drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+        drawDisplay(false, g_smoothSig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
 
         if (cfg.setSystemClock && !clockSet && utc != 0 &&
             f.confidence >= cfg.minConfidence) {
@@ -568,7 +571,7 @@ int main(int argc, char* argv[])
             else
                 fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
             // Redraw immediately to reflect updated clock-set status
-            drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+            drawDisplay(false, g_smoothSig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
         }
     }
 
