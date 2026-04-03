@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -116,7 +117,8 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
     // Line 1 — title, signal bar, frequency
     printf("\033[1mskyclock " SC_VERSION "\033[0m   ");
     printBar(sig);
-    printf(" %3.0f%%   %lld kHz\033[K\n", sig * 100.0f, freqKhz);
+    float snrDb = (sig < 0.9999f) ? -10.0f * log10f(1.0f - sig) : 30.0f;
+    printf(" SNR:%4.1f dB   %lld kHz\033[K\n", snrDb, freqKhz);
 
     // Line 2 — bit stream (searching) or decoded UTC time (locked)
     if (utc == 0) {
