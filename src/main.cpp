@@ -8,13 +8,14 @@
  * Configuration: ~/.skyclock/settings.json
  *
  * Usage:
- *   skyclock                    # decode from default audio device
- *   skyclock --device <name>    # use named PortAudio device
- *   skyclock --file <path>      # decode from audio file via ffmpeg
- *   skyclock --list-devices     # list audio devices and exit
- *   skyclock --list-rigs        # list hamlib rig models and exit
- *   skyclock --version          # print version and exit
- *   skyclock --help             # this help
+ *   skyclock                         # decode from default audio device
+ *   skyclock --device <name>         # use named PortAudio device
+ *   skyclock --file <path>           # fast decode from audio file (debug)
+ *   skyclock --file <path> --realtime  # real-time file simulation
+ *   skyclock --list-devices          # list audio devices and exit
+ *   skyclock --list-rigs             # list hamlib rig models and exit
+ *   skyclock --version               # print version and exit
+ *   skyclock --help                  # this help
  */
 
 #include "settings.h"
@@ -36,10 +37,20 @@
 
 #ifdef _WIN32
 #  include <io.h>
+#  include <windows.h>
 #  define isatty _isatty
 #  define fileno _fileno
+static void sleepMs(int ms) { Sleep((DWORD)ms); }
+static void enableAnsiConsole() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD  m = 0;
+    if (GetConsoleMode(h, &m))
+        SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
 #else
 #  include <unistd.h>
+static void sleepMs(int ms) { usleep((useconds_t)ms * 1000u); }
+static void enableAnsiConsole() {}
 #endif
 
 #ifndef SC_VERSION
@@ -51,10 +62,91 @@ static std::atomic<bool> g_running{true};
 static void on_signal(int) { g_running.store(false); }
 
 /* ── Shared decoder state (audio thread → main thread) ──────────────────── */
-static WwvDecoder* g_decoder = nullptr;
+static WwvDecoder* g_decoder    = nullptr;
 static std::mutex  g_frameMutex;
 static WwvTime     g_latestFrame;
 static bool        g_frameUpdated = false;
+
+/* ── TTY display state ───────────────────────────────────────────────────── */
+// Sliding window of the last 60 classified bits as printable chars.
+// Written only by the audio-thread bit callback; memmove of 59 bytes and
+// single char writes are safe without a mutex on all supported platforms.
+static char g_bitRow[61];      // display chars (., #, |, ?) + NUL; space-padded
+static int  g_bitPos = 0;      // total bits appended (for count label)
+
+static constexpr int kDisplayLines = 3;
+
+// Append one classified bit to the sliding display window.
+static void appendBitDisplay(int type)
+{
+    char c = (type == 0) ? '.' : (type == 1) ? '#' : (type == 2) ? '|' : '?';
+    if (g_bitPos < 60) {
+        g_bitRow[g_bitPos] = c;
+    } else {
+        memmove(g_bitRow, g_bitRow + 1, 59);
+        g_bitRow[59] = c;
+    }
+    ++g_bitPos;
+}
+
+// Print a 20-char signal-strength bar using Unicode block elements and ANSI colour.
+static void printBar(float sig)
+{
+    int filled = (int)(sig * 20.0f + 0.5f);
+    if (filled > 20) filled = 20;
+    if (filled > 0) printf("\033[32m");   // green for filled portion
+    for (int i = 0; i < filled; ++i)
+        printf("\xe2\x96\x88");           // █
+    printf("\033[2m");                    // dim for empty portion
+    for (int i = filled; i < 20; ++i)
+        printf("\xe2\x96\x91");           // ░
+    printf("\033[0m");
+}
+
+// Redraw (or initially draw) the 3-line status panel.
+// Uses \033[NA to move the cursor up and overwrite previous content.
+// Each line ends with \033[K to clear any leftover chars from a longer previous value.
+static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
+                        bool clockSet, long long freqKhz, int minConf)
+{
+    if (!first)
+        printf("\033[%dA\r", kDisplayLines);
+
+    // Line 1 — title, signal bar, frequency
+    printf("\033[1mskyclock " SC_VERSION "\033[0m   ");
+    printBar(sig);
+    printf(" %3.0f%%   %lld kHz\033[K\n", sig * 100.0f, freqKhz);
+
+    // Line 2 — bit stream (searching) or decoded UTC time (locked)
+    if (utc == 0) {
+        printf("\033[33m[%s]\033[0m  %d bit%s\033[K\n",
+               g_bitRow, g_bitPos, g_bitPos == 1 ? "" : "s");
+    } else {
+        struct tm t;
+#ifdef _WIN32
+        gmtime_s(&t, &utc);
+#else
+        gmtime_r(&utc, &t);
+#endif
+        printf("\033[1m%04d-%02d-%02d %02d:%02d:%02d UTC\033[0m"
+               "  Day %03d  UT1%+.1fs  [conf:%d]\033[K\n",
+               t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+               t.tm_hour, t.tm_min, t.tm_sec,
+               f.dayOfYear, f.ut1Seconds, f.confidence);
+    }
+
+    // Line 3 — status
+    if (utc == 0) {
+        printf("\033[33mSearching for WWV signal...\033[0m\033[K\n");
+    } else if (clockSet) {
+        printf("\033[1m\033[32mLOCKED\033[0m  — clock set successfully\033[K\n");
+    } else {
+        printf("\033[1m\033[32mLOCKED\033[0m"
+               "  [conf: %d / %d needed]\033[K\n", f.confidence, minConf);
+    }
+
+    fflush(stdout);
+}
 
 /* ── PortAudio callback ──────────────────────────────────────────────────── */
 static int pa_callback(const void* input, void* /*output*/,
@@ -86,49 +178,30 @@ static void listDevices()
     Pa_Terminate();
 }
 
-/* ── Time display helpers ────────────────────────────────────────────────── */
-static void printTime(time_t utc, const WwvTime& f, float sigLevel, bool tty)
-{
-    struct tm t;
-#ifdef _WIN32
-    gmtime_s(&t, &utc);
-#else
-    gmtime_r(&utc, &t);
-#endif
-    if (tty) printf("\r");
-    printf("%04d-%02d-%02d %02d:%02d:%02d UTC  "
-           "Day %03d  UT1%+.1fs  Signal: %3.0f%%  [conf: %d]   ",
-           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-           t.tm_hour, t.tm_min, t.tm_sec,
-           f.dayOfYear,
-           f.ut1Seconds,
-           sigLevel * 100.0f,
-           f.confidence);
-    if (!tty) printf("\n");
-    fflush(stdout);
-}
-
 /* ── Help ────────────────────────────────────────────────────────────────── */
 static void printHelp(const char* argv0)
 {
     printf("skyclock %s — WWV time code decoder\n\n", SC_VERSION);
     printf("Usage: %s [OPTIONS]\n\n", argv0);
-    printf("  --device <name>    Use named PortAudio audio input device\n");
-    printf("  --file <path>      Decode from audio file via ffmpeg (no radio/PortAudio)\n");
-    printf("  --list-devices     List available audio input devices and exit\n");
-    printf("  --list-rigs        List available hamlib rig models and exit\n");
-    printf("  --version          Print version and exit\n");
-    printf("  --help             This help\n\n");
+    printf("  --device <name>      Use named PortAudio audio input device\n");
+    printf("  --file <path>        Fast decode from audio file (debug mode)\n");
+    printf("  --file <path> --realtime\n");
+    printf("                       Decode audio file at real-time speed\n");
+    printf("                       (simulates a live radio; shows status panel)\n");
+    printf("  --list-devices       List available audio input devices and exit\n");
+    printf("  --list-rigs          List available hamlib rig models and exit\n");
+    printf("  --version            Print version and exit\n");
+    printf("  --help               This help\n\n");
     printf("Configuration: ~/.skyclock/settings.json\n");
     printf("  Key settings:\n");
-    printf("    rigEnabled       true/false  (default: false)\n");
-    printf("    rigModel         hamlib model number\n");
-    printf("    rigPort          serial port path\n");
-    printf("    freqKhz          WWV frequency in kHz (2500/5000/10000/15000/20000)\n");
-    printf("    rigMode          radio mode string, e.g. \"AM\"\n");
-    printf("    audioDevice      audio device name substring (empty = default)\n");
-    printf("    setSystemClock   true/false (requires root/admin)\n");
-    printf("    minConfidence    consecutive frames required before setting clock\n\n");
+    printf("    rigEnabled         true/false  (default: false)\n");
+    printf("    rigModel           hamlib model number\n");
+    printf("    rigPort            serial port path\n");
+    printf("    freqKhz            WWV frequency in kHz (2500/5000/10000/15000/20000)\n");
+    printf("    rigMode            radio mode string, e.g. \"AM\"\n");
+    printf("    audioDevice        audio device name substring (empty = default)\n");
+    printf("    setSystemClock     true/false (requires root/admin)\n");
+    printf("    minConfidence      consecutive frames required before setting clock\n\n");
     printf("WWV frequencies (kHz): 2500, 5000, 10000, 15000, 20000\n");
     printf("Recommended: tune to 10000 kHz, mode AM.\n");
 }
@@ -138,6 +211,7 @@ int main(int argc, char* argv[])
 {
     bool listDev  = false;
     bool listRigs = false;
+    bool realtime = false;
     std::string deviceName;
     std::string filePath;
 
@@ -154,6 +228,8 @@ int main(int argc, char* argv[])
             deviceName = argv[++i];
         } else if (!strcmp(argv[i], "--file") && i + 1 < argc) {
             filePath = argv[++i];
+        } else if (!strcmp(argv[i], "--realtime")) {
+            realtime = true;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -174,24 +250,27 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    // Load settings (creates default file on first run)
     Settings& cfg = Settings::instance();
-    cfg.save(); // write defaults if file missing
+    cfg.save();
 
     bool isTty = isatty(fileno(stdout)) != 0;
+    if (isTty) enableAnsiConsole();
+
+    memset(g_bitRow, ' ', 60);
+    g_bitRow[60] = '\0';
 
     printf("skyclock %s\n", SC_VERSION);
 
-    // ── File mode (--file) ─────────────────────────────────────────────────
-    // Bypass PortAudio and radio; decode directly from an audio file via ffmpeg.
-    if (!filePath.empty()) {
-        static constexpr float kFileSampleRate = 48000.0f;
+    // ── Fast file mode (--file, no --realtime) ─────────────────────────────
+    // Decodes as fast as possible; prints bits and status as plain scrolling
+    // text.  Useful for debugging signal files.
+    if (!filePath.empty() && !realtime) {
+        static constexpr float kSR    = 48000.0f;
         static constexpr int   kChunk = 512;
-        // Display update every ~200 ms of audio time
-        static constexpr int   kDisplayEvery =
-            (int)(kFileSampleRate * 0.2f / kChunk); // ~18 chunks
+        // Status line every ~2 s of audio time
+        static constexpr int   kStatusEvery = (int)(kSR * 2.0f / kChunk);
 
-        WwvDecoder decoder(kFileSampleRate);
+        WwvDecoder decoder(kSR);
         g_decoder = &decoder;
 
         decoder.setFrameCallback([&](const WwvTime& frame) {
@@ -210,82 +289,146 @@ int main(int argc, char* argv[])
             fflush(stdout);
         });
 
-        // ffmpeg decodes any format to raw mono float32 at 48 kHz on stdout.
-        // Double-quote the path to handle spaces; paths with embedded " not supported.
         std::string cmd = std::string("ffmpeg -i \"") + filePath +
                           "\" -f f32le -ar 48000 -ac 1 -loglevel quiet -";
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
-            fprintf(stderr, "Failed to launch ffmpeg for: %s\n", filePath.c_str());
+            fprintf(stderr, "Failed to launch ffmpeg: %s\n", filePath.c_str());
             return 1;
         }
+        printf("File (fast): %s\nPress Ctrl+C to stop.\n\n", filePath.c_str());
 
-        printf("File: %s  (ffmpeg → %.0f Hz mono f32le)\n"
-               "Press Ctrl+C to stop.\n\n",
-               filePath.c_str(), kFileSampleRate);
-
-        signal(SIGINT,  on_signal);
+        signal(SIGINT, on_signal);
 #ifndef _WIN32
         signal(SIGTERM, on_signal);
 #endif
 
         float buf[kChunk];
-        int   displayCounter = 0;
-        bool  clockSet = false;
         int   statusTick = 0;
 
         while (g_running.load()) {
             size_t got = fread(buf, sizeof(float), kChunk, pipe);
-            if (got == 0) break; // EOF or error
-
+            if (got == 0) break;
             decoder.pushSamples(buf, (int)got);
-
-            if (++displayCounter < kDisplayEvery) continue;
-            displayCounter = 0;
 
             WwvTime frame;
             bool updated = false;
             {
                 std::lock_guard<std::mutex> lk(g_frameMutex);
                 if (g_frameUpdated) {
-                    frame          = g_latestFrame;
-                    updated        = true;
-                    g_frameUpdated = false;
+                    frame = g_latestFrame; updated = true; g_frameUpdated = false;
                 }
             }
-            if (updated && isTty) { printf("\n"); needNewline = false; }
 
             time_t utc = decoder.currentUtc();
             float  sig = decoder.signalLevel();
 
-            if (utc == 0) {
-                if (++statusTick % 10 == 0)
-                    printf("\n-- Signal: %3.0f%%  Bits: %d --\n",
-                           sig * 100.0f, decoder.bitsReceived());
-            } else {
-                WwvTime f = decoder.lastFrame();
-                printTime(utc, f, sig, isTty);
-                needNewline = isTty; // \r was written; next bit needs a newline
-
-                if (cfg.setSystemClock && !clockSet &&
-                    f.confidence >= cfg.minConfidence) {
-                    std::string clockErr;
-                    if (setSystemClock(decoder.currentUtcPoint(), clockErr)) {
-                        printf("\nClock set to %lld UTC\n", (long long)utc);
-                        clockSet = true;
-                    } else {
-                        fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
-                    }
-                }
+            if (updated) {
+                if (isTty && needNewline) { printf("\n"); needNewline = false; }
+                struct tm t;
+#ifdef _WIN32
+                gmtime_s(&t, &utc);
+#else
+                gmtime_r(&utc, &t);
+#endif
+                printf("\n==> %04d-%02d-%02d %02d:%02d:%02d UTC"
+                       "  Day %03d  UT1%+.1fs  [conf:%d]\n\n",
+                       t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                       t.tm_hour, t.tm_min, t.tm_sec,
+                       frame.dayOfYear, frame.ut1Seconds, frame.confidence);
+                needNewline = false;
+            } else if (utc == 0 && ++statusTick % kStatusEvery == 0) {
+                if (needNewline) { printf("\n"); needNewline = false; }
+                printf("-- Signal: %3.0f%%  Bits: %d --\n",
+                       sig * 100.0f, decoder.bitsReceived());
             }
         }
 
-        if (isTty) printf("\n");
+        if (isTty && needNewline) printf("\n");
         pclose(pipe);
         return 0;
     }
 
-    // ── Live mode ──────────────────────────────────────────────────────────
+    // ── Real-time file mode (--file --realtime) ────────────────────────────
+    // Feeds audio at 48 kHz pace to simulate a live radio, with the same
+    // status panel as live mode.
+    if (!filePath.empty() && realtime) {
+        static constexpr float kSR        = 48000.0f;
+        static constexpr int   kRtChunk   = 480;   // 10 ms per chunk at 48 kHz
+        static constexpr int   kRtSleepMs = 10;
+        static constexpr int   kDrawEvery = 20;    // redraw every 200 ms
+
+        WwvDecoder decoder(kSR);
+        g_decoder = &decoder;
+
+        decoder.setFrameCallback([&](const WwvTime& frame) {
+            std::lock_guard<std::mutex> lk(g_frameMutex);
+            g_latestFrame  = frame;
+            g_frameUpdated = true;
+        });
+
+        decoder.setBitCallback([](int type, int /*ms*/) {
+            appendBitDisplay(type);
+        });
+
+        std::string cmd = std::string("ffmpeg -i \"") + filePath +
+                          "\" -f f32le -ar 48000 -ac 1 -loglevel quiet -";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            fprintf(stderr, "Failed to launch ffmpeg: %s\n", filePath.c_str());
+            return 1;
+        }
+        printf("File (real-time): %s\nPress Ctrl+C to stop.\n", filePath.c_str());
+
+        signal(SIGINT, on_signal);
+#ifndef _WIN32
+        signal(SIGTERM, on_signal);
+#endif
+
+        float buf[kRtChunk];
+        int   chunkCount = 0;
+        bool  clockSet   = false;
+
+        // Print initial display block
+        drawDisplay(true, 0.0f, 0, WwvTime{}, false, cfg.freqKhz, cfg.minConfidence);
+
+        while (g_running.load()) {
+            size_t got = fread(buf, sizeof(float), kRtChunk, pipe);
+            if (got == 0) break;
+            decoder.pushSamples(buf, (int)got);
+            sleepMs(kRtSleepMs);
+
+            if (++chunkCount % kDrawEvery != 0) continue;
+
+            {
+                std::lock_guard<std::mutex> lk(g_frameMutex);
+                g_frameUpdated = false;
+            }
+
+            time_t utc = decoder.currentUtc();
+            float  sig = decoder.signalLevel();
+            WwvTime f  = decoder.lastFrame();
+
+            drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+
+            if (cfg.setSystemClock && !clockSet && utc != 0 &&
+                f.confidence >= cfg.minConfidence) {
+                std::string clockErr;
+                if (setSystemClock(decoder.currentUtcPoint(), clockErr))
+                    clockSet = true;
+                else
+                    fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
+                // Redraw immediately to show updated status
+                drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+            }
+        }
+
+        printf("\n");
+        pclose(pipe);
+        return 0;
+    }
+
+    // ── Live mode (PortAudio) ──────────────────────────────────────────────
     printf("Config: %s\n", cfg.path().c_str());
     printf("Frequency: %lld kHz  Mode: %s\n", cfg.freqKhz, cfg.rigMode.c_str());
 
@@ -327,7 +470,6 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // Use command-line --device if given, else fall back to settings, else default
     std::string devMatch = deviceName.empty() ? cfg.audioDevice : deviceName;
 
     PaDeviceIndex devIdx = Pa_GetDefaultInputDevice();
@@ -359,32 +501,21 @@ int main(int argc, char* argv[])
 
     decoder.setFrameCallback([&](const WwvTime& frame) {
         std::lock_guard<std::mutex> lk(g_frameMutex);
-        g_latestFrame   = frame;
-        g_frameUpdated  = true;
+        g_latestFrame  = frame;
+        g_frameUpdated = true;
     });
 
-    // Print each classified bit as it arrives so the operator can see the
-    // signal structure before a full frame is decoded.
-    //   '.' = 0 (200 ms)   '#' = 1 (500 ms)   '|' = marker (800 ms)   '?' = missing
-    // A newline is printed after each marker to visually separate the
-    // 9-bit groups (P0..P5) that make up a WWV frame.
-    bool needNewline = false; // true if searching \r line is on screen
-    decoder.setBitCallback([&needNewline, isTty](int type, int ms) {
-        if (needNewline) { printf("\n"); needNewline = false; }
-        if (type == 0)      printf(".(%d) ", ms);
-        else if (type == 1) printf("#(%d) ", ms);
-        else if (type == 2) printf("|  (%d ms)\n", ms);  // marker: newline after each group
-        else                printf("? ");                 // BIT_MISSING gap-fill
-        fflush(stdout);
+    // Bit callback: update the sliding display row (audio thread).
+    decoder.setBitCallback([](int type, int /*ms*/) {
+        appendBitDisplay(type);
     });
 
     // ── Open audio stream ──────────────────────────────────────────────────
     PaStreamParameters inParams{};
-    inParams.device                    = devIdx;
-    inParams.channelCount              = 1;
-    inParams.sampleFormat              = paFloat32;
-    inParams.suggestedLatency          = devInfo ? devInfo->defaultLowInputLatency
-                                                 : 0.1;
+    inParams.device           = devIdx;
+    inParams.channelCount     = 1;
+    inParams.sampleFormat     = paFloat32;
+    inParams.suggestedLatency = devInfo ? devInfo->defaultLowInputLatency : 0.1;
 
     PaStream* stream = nullptr;
     err = Pa_OpenStream(&stream, &inParams, nullptr,
@@ -394,77 +525,55 @@ int main(int argc, char* argv[])
         Pa_Terminate(); return 1;
     }
 
-    // Compensate for audio pipeline latency.  Pa_GetStreamInfo reports the
-    // actual input latency after the stream is opened; this includes the ADC
-    // hardware buffer, OS driver buffer, and the PortAudio layer.  Shifting
-    // the audio epoch backward by this amount aligns decoder timestamps with
-    // when sound actually entered the microphone rather than when samples
-    // arrived in the callback.
+    // Compensate for audio pipeline latency so that decoder timestamps reflect
+    // when sound entered the microphone, not when samples arrived in the callback.
     if (const PaStreamInfo* si = Pa_GetStreamInfo(stream)) {
         decoder.setAudioLatency(si->inputLatency);
         printf("Audio latency: %.1f ms (compensated)\n", si->inputLatency * 1000.0);
     }
 
-    signal(SIGINT,  on_signal);
+    signal(SIGINT, on_signal);
 #ifndef _WIN32
     signal(SIGTERM, on_signal);
 #endif
 
     Pa_StartStream(stream);
-    printf("Listening. Press Ctrl+C to stop.\n\n");
+    printf("Listening. Press Ctrl+C to stop.\n");
 
     // ── Main display loop ──────────────────────────────────────────────────
     bool clockSet = false;
-    while (g_running.load()) {
-        Pa_Sleep(200); // 200 ms update interval
 
-        // Check for a newly decoded frame
-        WwvTime frame;
-        bool updated = false;
+    // Print initial display block
+    drawDisplay(true, 0.0f, 0, WwvTime{}, false, cfg.freqKhz, cfg.minConfidence);
+
+    while (g_running.load()) {
+        Pa_Sleep(200);
+
         {
             std::lock_guard<std::mutex> lk(g_frameMutex);
-            if (g_frameUpdated) {
-                frame = g_latestFrame;
-                updated = true;
-                g_frameUpdated = false;
-            }
-        }
-        if (updated && isTty) {
-            printf("\n");
+            g_frameUpdated = false;  // consumed
         }
 
-        time_t utc = decoder.currentUtc();
-        float sig  = decoder.signalLevel();
+        time_t  utc = decoder.currentUtc();
+        float   sig = decoder.signalLevel();
+        WwvTime f   = decoder.lastFrame();
 
-        if (utc == 0) {
-            // Bit stream is printed inline by the bit callback.
-            // Print a periodic signal-level status line (not \r, so it
-            // doesn't stomp the bit stream).
-            static int statusTick = 0;
-            if (++statusTick % 10 == 0) { // every ~2 s
-                printf("\n-- Signal: %3.0f%%  Bits: %d --\n",
-                       sig * 100.0f, decoder.bitsReceived());
-            }
-        } else {
-            WwvTime f = decoder.lastFrame();
-            printTime(utc, f, sig, isTty);
+        drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
 
-            // Optionally sync the system clock
-            if (cfg.setSystemClock && !clockSet &&
-                f.confidence >= cfg.minConfidence) {
-                std::string clockErr;
-                if (setSystemClock(utc, clockErr)) {
-                    printf("\nClock set to %lld UTC\n", (long long)utc);
-                    clockSet = true;
-                } else {
-                    fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
-                }
-            }
+        if (cfg.setSystemClock && !clockSet && utc != 0 &&
+            f.confidence >= cfg.minConfidence) {
+            std::string clockErr;
+            if (setSystemClock(decoder.currentUtcPoint(), clockErr))
+                clockSet = true;
+            else
+                fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
+            // Redraw immediately to reflect updated clock-set status
+            drawDisplay(false, sig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
         }
     }
 
     // ── Cleanup ────────────────────────────────────────────────────────────
-    if (isTty) printf("\n");
+    printf("\n");
     Pa_StopStream(stream);
     Pa_CloseStream(stream);
     Pa_Terminate();
