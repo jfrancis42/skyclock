@@ -3,9 +3,9 @@
 A command-line WWV time code decoder and system clock synchroniser written in C++17.
 
 Receives the NIST WWV shortwave time signal through a connected radio (or any audio
-input), decodes the BCD time code from audio in real time, displays current UTC, and
-optionally sets the system clock once a configurable number of consecutive frames have
-been verified.
+input), decodes the BCD time code from audio in real time, displays current UTC with
+a live status panel, and optionally sets the system clock once a configurable number
+of consecutive frames have been verified.
 
 **Status: early alpha.** Decodes reliably from clean recordings, live reception under
 good propagation, and HF signals degraded by severe flutter fading.
@@ -31,11 +31,11 @@ WWV (Fort Collins, Colorado) transmits on 2.5, 5, 10, 15, and 20 MHz. Every seco
 begins with a 5 ms 1 kHz sine-wave "tick" at the precise on-time point, followed by a
 100 Hz subcarrier burst whose duration encodes one BCD bit:
 
-| Duration | Bit type    | Meaning                        |
-|----------|-------------|--------------------------------|
-| 200 ms   | `0` (ZERO)  | BCD data zero                  |
-| 500 ms   | `1` (ONE)   | BCD data one                   |
-| 800 ms   | `M` (MARKER)| Position marker                |
+| Duration | Bit type    | Meaning         |
+|----------|-------------|-----------------|
+| 200 ms   | `0` (ZERO)  | BCD data zero   |
+| 500 ms   | `1` (ONE)   | BCD data one    |
+| 800 ms   | `M` (MARKER)| Position marker |
 
 One complete frame is 60 bits (one per second, one frame per minute). Position markers
 occur at seconds 0, 9, 19, 29, 39, and 49 within each frame and are used by the
@@ -134,9 +134,15 @@ in the ring buffer. A candidate frame is accepted when:
 3. The decoded minute (0–59), hour (0–23), day of year (1–366), and year (0–99) are
    all in valid range.
 
-Once a valid frame is decoded, `currentUtc()` extrapolates forward from the P0 tick
-timestamp using `std::chrono::steady_clock` to give a running real-time UTC estimate
-accurate to roughly ±50 ms under typical conditions.
+### Clock accuracy
+
+Once a valid frame is decoded, `currentUtcPoint()` extrapolates forward from the P0
+tick timestamp using `std::chrono::steady_clock`, preserving sub-second precision via
+`tv_usec` / FILETIME microseconds when setting the system clock. Audio pipeline
+latency (ADC buffer + OS driver + PortAudio layer) is read from
+`Pa_GetStreamInfo()->inputLatency` after the stream opens and compensated
+automatically. Practical accuracy under typical conditions is **±50 ms**, bounded by
+the 10 ms Goertzel block resolution.
 
 ---
 
@@ -144,10 +150,10 @@ accurate to roughly ±50 ms under typical conditions.
 
 ### Dependencies
 
-| Library    | Purpose              | Package (Debian/Ubuntu)         |
-|------------|----------------------|---------------------------------|
-| PortAudio  | Live audio capture   | `libportaudio19-dev`            |
-| Hamlib     | Radio CAT control    | `libhamlib-dev` *(optional)*    |
+| Library    | Purpose              | Package (Debian/Ubuntu)      |
+|------------|----------------------|------------------------------|
+| PortAudio  | Live audio capture   | `libportaudio19-dev`         |
+| Hamlib     | Radio CAT control    | `libhamlib-dev` *(optional)* |
 
 ```sh
 sudo apt install cmake build-essential libportaudio19-dev
@@ -163,42 +169,68 @@ cmake --build build -j2
 
 The binary is `build/skyclock`. No install step is required to run it.
 
+### Pre-built binaries
+
+Pre-built releases are available in the repository:
+
+| File                                    | Platform                     |
+|-----------------------------------------|------------------------------|
+| `skyclock-VERSION-x86_64.AppImage`      | Linux x86-64 (self-contained)|
+| `skyclock-VERSION-rpi-aarch64.tar.gz`   | Raspberry Pi (64-bit OS)     |
+| `skyclock-VERSION-windows-x64.zip`      | Windows 10+ x64              |
+
+The Windows zip includes the required runtime DLLs (`libportaudio.dll`,
+`libgcc_s_seh-1.dll`, `libstdc++-6.dll`, `libwinpthread-1.dll`). Extract and run
+`skyclock.exe` from any directory.
+
 ---
 
 ## Usage
 
 ```
-skyclock                        # decode from default audio device
-skyclock --device <name>        # use a named PortAudio input device
-skyclock --file <path>          # decode from an audio file via ffmpeg
-skyclock --list-devices         # list audio input devices and exit
-skyclock --list-rigs            # list hamlib rig models and exit (requires hamlib)
-skyclock --version              # print version and exit
-skyclock --help                 # this help
+skyclock                             # decode from default audio device
+skyclock --device <name>             # use a named PortAudio input device
+skyclock --file <path>               # fast decode from audio file (debug)
+skyclock --file <path> --realtime    # real-time file simulation (see below)
+skyclock --list-devices              # list audio input devices and exit
+skyclock --list-rigs                 # list hamlib rig models (requires hamlib)
+skyclock --version                   # print version and exit
+skyclock --help                      # this help
 ```
 
-### Live reception example
+### Live reception
 
 Tune your radio to **10 000 kHz AM**, connect audio output to the PC sound card input,
-then:
+then run:
 
 ```sh
 ./build/skyclock
 ```
 
-As bits are classified they are printed inline:
-```
-.  = BIT_ZERO  (200 ms)
-#  = BIT_ONE   (500 ms)
-|  = MARKER    (800 ms)  — newline after each 9-bit group
-?  = MISSING   (no signal detected)
-```
-
-Once a frame decodes, the running time line replaces the bit stream:
+A 3-line status panel updates in place while listening:
 
 ```
-2024-10-12 14:32:07 UTC  Day 286  UT1+0.2s  Signal:  87%  [conf: 3]
+skyclock 0.1.1-ALPHA   ████████████░░░░░░░░ 60%   10000 kHz
+[|.#.##.#.|.##.##.#.|....                      ]  22 bits
+Searching for WWV signal...
 ```
+
+The bracket on line 2 shows the last 60 classified bits as a sliding window:
+`.` = ZERO, `#` = ONE, `|` = MARKER, `?` = MISSING.
+
+Once a frame decodes, lines 2 and 3 update:
+
+```
+skyclock 0.1.1-ALPHA   ████████████░░░░░░░░ 60%   10000 kHz
+2026-04-02 19:23:45 UTC  Day 092  UT1 -0.3s  [conf: 3]
+LOCKED  [conf: 3 / 2 needed]
+```
+
+After the configured number of consecutive valid frames (`minConfidence`), the system
+clock is set and line 3 changes to `LOCKED — clock set successfully`.
+
+The status panel is only drawn when stdout is a TTY; plain scrolling text is used
+otherwise (pipes, log files, etc.).
 
 ---
 
@@ -207,16 +239,16 @@ Once a frame decodes, the running time line replaces the bit stream:
 Settings are stored in `~/.skyclock/settings.json`, created with defaults on first
 run.
 
-| Key              | Type    | Default        | Description                                  |
-|------------------|---------|----------------|----------------------------------------------|
-| `rigEnabled`     | bool    | `false`        | Enable hamlib radio control                  |
-| `rigModel`       | int     | `1`            | Hamlib rig model number                      |
-| `rigPort`        | string  | `/dev/ttyUSB0` | Serial port for CAT control                  |
-| `freqKhz`        | int     | `10000`        | WWV frequency to tune (kHz)                  |
-| `rigMode`        | string  | `"AM"`         | Radio mode string                            |
-| `audioDevice`    | string  | `""`           | Audio device name substring (empty = default)|
-| `setSystemClock` | bool    | `false`        | Set system clock after decode (needs root)   |
-| `minConfidence`  | int     | `2`            | Consecutive valid frames before setting clock|
+| Key              | Type    | Default        | Description                                   |
+|------------------|---------|----------------|-----------------------------------------------|
+| `rigEnabled`     | bool    | `false`        | Enable hamlib radio control                   |
+| `rigModel`       | int     | `1`            | Hamlib rig model number                       |
+| `rigPort`        | string  | `/dev/ttyUSB0` | Serial port for CAT control                   |
+| `freqKhz`        | int     | `10000`        | WWV frequency to tune (kHz)                   |
+| `rigMode`        | string  | `"AM"`         | Radio mode string                             |
+| `audioDevice`    | string  | `""`           | Audio device name substring (empty = default) |
+| `setSystemClock` | bool    | `false`        | Set system clock after decode (needs root)    |
+| `minConfidence`  | int     | `2`            | Consecutive valid frames before setting clock |
 
 WWV transmits on 2 500, 5 000, 10 000, 15 000, and 20 000 kHz. 10 000 kHz is the most
 reliable frequency across North America during daylight hours.
@@ -225,13 +257,32 @@ reliable frequency across North America during daylight hours.
 
 ## Reading audio files (ffmpeg)
 
-The `--file` mode pipes the audio file through **ffmpeg**, which handles any format
-ffmpeg understands (MP3, OGG, Opus, FLAC, WAV, …) and resamples to 48 kHz mono
-float32 on the fly. ffmpeg must be installed and in `PATH`:
+The `--file` mode decodes audio files via **ffmpeg**, which handles any format ffmpeg
+understands (MP3, OGG, Opus, FLAC, WAV, …) and resamples to 48 kHz mono float32 on
+the fly. ffmpeg must be installed and in `PATH`:
 
 ```sh
 sudo apt install ffmpeg
 ```
+
+### Fast file mode (default)
+
+```sh
+skyclock --file recording.opus
+```
+
+Decodes as quickly as the CPU allows. Bits are printed as they are classified and
+frame decodes are prefixed with `==>`. Useful for testing and debugging signal files.
+
+### Real-time simulation mode
+
+```sh
+skyclock --file recording.opus --realtime
+```
+
+Paces audio playback at 48 kHz real-time speed (10 ms chunks with 10 ms sleeps),
+showing the same live status panel as radio mode. Use this to test the display
+pipeline or to simulate a live reception session from a recording.
 
 ---
 
@@ -251,6 +302,9 @@ sudo apt install ffmpeg
   genuine ticks have near-floor p100 (subcarrier hasn't started yet); harmonic false
   triggers have simultaneous elevated p100 and p1k. The 950 ms lockout provides
   additional protection.
+- **Sub-second clock accuracy**: audio pipeline latency is read from PortAudio and
+  compensated automatically; the system clock is set with microsecond precision via
+  `tv_usec` / FILETIME. Practical accuracy is ±50 ms under typical conditions.
 
 ---
 
@@ -269,12 +323,6 @@ WWVH (Hawaii) transmits on the same frequencies as WWV. Both stations are receiv
 across much of North America on 10 and 15 MHz. The decoder does not distinguish
 between them; mixed reception can produce garbled frames. Tuning to 5 MHz (WWV only)
 typically gives the cleanest single-station decode.
-
-### Linux only (for now)
-
-The code compiles on Linux. Windows support is structurally present (PortAudio is
-cross-platform; clock-setting code is conditionally compiled), but has not been tested
-on a live Windows system. Cross-compile toolchain files are included in the repository.
 
 ### Hamlib integration untested end-to-end
 
