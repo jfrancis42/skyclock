@@ -84,6 +84,10 @@ WwvDecoder::WwvDecoder(float sampleRate)
     , m_blockSize(static_cast<int>(sampleRate * 0.010f)) // 10 ms blocks
     , m_blockBuf(m_blockSize, 0.0f)
     , m_lastTickTime(std::chrono::steady_clock::now())
+    , m_earlyRaw(20 * static_cast<int>(sampleRate * 0.010f), 0.0f)
+    , m_midRaw  (30 * static_cast<int>(sampleRate * 0.010f), 0.0f)
+    , m_lateRaw (30 * static_cast<int>(sampleRate * 0.010f), 0.0f)
+    , m_noiseRaw( 6 * static_cast<int>(sampleRate * 0.010f), 0.0f)
     , m_audioEpoch(std::chrono::steady_clock::now())
 {
     memset(m_bits, 0, sizeof(m_bits));
@@ -177,12 +181,8 @@ void WwvDecoder::processBlock(const float* block)
                 && (p100 < m_background100 * 10.0f);
     if (static_cast<int>(m_totalBlocks) - m_lastTickBlock < 95) tickNow = false;
     if (tickNow && !m_tickLastBlock) {
-        // Rising edge: reset energy accumulators for the new second.
-        m_accEarly = 0.0f;
-        m_accMid   = 0.0f;
-        m_accLate  = 0.0f;
-        m_accNoise = 0.0f;
-
+        // Rising edge: reset raw sample buffers for the new second.
+        m_earlyFill = m_midFill = m_lateFill = m_noiseFill = 0;
         m_lastTickBlock = m_totalBlocks;
         m_lastTickTime  = blockTime;
     }
@@ -202,11 +202,7 @@ void WwvDecoder::processBlock(const float* block)
     int bat_predict = m_totalBlocks - m_lastTickBlock;
     if (m_lastTickBlock > 0 && bat_predict == k_predDelay && !tickNow) {
         // Real tick didn't arrive — advance prediction.
-        m_accEarly = 0.0f;
-        m_accMid   = 0.0f;
-        m_accLate  = 0.0f;
-        m_accNoise = 0.0f;
-
+        m_earlyFill = m_midFill = m_lateFill = m_noiseFill = 0;
         m_lastTickBlock = m_totalBlocks;
         m_lastTickTime  = blockTime;
     }
@@ -219,32 +215,45 @@ void WwvDecoder::processBlock(const float* block)
     // the first real 1 kHz tick is slower to acquire but produces an accurate
     // phase reference that the free-running prediction then extrapolates correctly.
 
-    // ── Energy accumulation into sub-windows ─────────────────────────────────
-    // bat = blocks after tick.  Each block's raw 100 Hz Goertzel power is added
-    // to the appropriate window.  Raw power (not the EMA) accumulates correctly
-    // from incoherent flutter fragments — brief bursts simply add their energy
-    // to whichever window they land in.
+    // ── Raw sample accumulation into sub-windows ─────────────────────────────
+    // bat = blocks after tick.  Raw audio samples are copied into per-window
+    // buffers so that a single coherent Goertzel can be computed over the
+    // entire window at the window boundary.  Coherent integration narrows the
+    // effective 100 Hz DFT bin from ±50 Hz (10 ms) to ±2.5 Hz (200 ms) or
+    // ±1.7 Hz (300 ms), reducing broadband-audio noise contamination by ~20×.
     int bat = m_totalBlocks - m_lastTickBlock;
 
-    if      (bat >= 3  && bat <= 22) m_accEarly += p100;
-    else if (bat >= 23 && bat <= 52) m_accMid   += p100;
-    else if (bat >= 53 && bat <= 82) m_accLate  += p100;
-    else if (bat >= 92 && bat <= 97) m_accNoise += p100;
+    if (bat >= 3 && bat <= 22) {
+        std::copy(block, block + m_blockSize, m_earlyRaw.data() + m_earlyFill);
+        m_earlyFill += m_blockSize;
+    } else if (bat >= 23 && bat <= 52) {
+        std::copy(block, block + m_blockSize, m_midRaw.data() + m_midFill);
+        m_midFill += m_blockSize;
+    } else if (bat >= 53 && bat <= 82) {
+        std::copy(block, block + m_blockSize, m_lateRaw.data() + m_lateFill);
+        m_lateFill += m_blockSize;
+    } else if (bat >= 92 && bat <= 97) {
+        std::copy(block, block + m_blockSize, m_noiseRaw.data() + m_noiseFill);
+        m_noiseFill += m_blockSize;
+    }
 
     // ── Classify at 830 ms ───────────────────────────────────────────────────
     if (bat == 83) {
         onWindowClose(m_lastTickTime);
     }
 
-    // ── Update noise floor at end of noise tail window ───────────────────────
-    // At bat == 98 (980 ms) the 6-block noise measurement is complete.
-    // Update the rolling EMA.  α = 0.1 gives ~10 second settling time.
+    // ── Update noise floor at end of noise tail window (980 ms) ─────────────
+    // Compute a single coherent Goertzel over the 60 ms noise window.
+    // m_noiseFloor100 is an EMA of E_noise = goertzel_power × n_samples.
+    // For broadband noise (variance σ²): E_noise ≈ σ² (window-length independent).
+    // α = 0.1 → ~10 s settling time.
     if (bat == 98) {
+        float e_noise = goertzel(m_noiseRaw.data(), m_noiseFill, 100.0f, m_sampleRate);
+        float E_noise = (m_noiseFill > 0) ? e_noise * (float)m_noiseFill : 0.0f;
         const float noiseAlpha = 0.1f;
-        m_noiseFloor100 = (1.0f - noiseAlpha) * m_noiseFloor100
-                        + noiseAlpha * m_accNoise;
-        if (m_noiseFloor100 < 1e-12f) m_noiseFloor100 = 1e-12f;
-        m_accNoise = 0.0f;
+        m_noiseFloor100 = (1.0f - noiseAlpha) * m_noiseFloor100 + noiseAlpha * E_noise;
+        if (m_noiseFloor100 < 1e-15f) m_noiseFloor100 = 1e-15f;
+        m_noiseFill = 0;
     }
 }
 
@@ -260,22 +269,37 @@ void WwvDecoder::appendBit(int type, std::chrono::steady_clock::time_point t)
 /* ── onWindowClose ───────────────────────────────────────────────────────── */
 void WwvDecoder::onWindowClose(std::chrono::steady_clock::time_point tickTime)
 {
-    // Classify the accumulated sub-window energies.
-    float e_early = m_accEarly;   // 30–230 ms (20 blocks)
-    float e_mid   = m_accMid;     // 230–530 ms (30 blocks)
-    float e_late  = m_accLate;    // 530–830 ms (30 blocks)
-    float e_total = e_early + e_mid + e_late;
+    // Compute coherent full-window Goertzel for each sub-window.
+    // Goertzel power is normalised to per-sample² (divided by n²), so:
+    //   pure tone (amplitude A): power ≈ A²/4   (independent of window length)
+    //   broadband noise (σ²):    power ≈ σ²/n   (falls as window grows)
+    //
+    // Coherent energy E = power × n:
+    //   signal:  E ≈ n × A²/4    (grows with window — longer window captures more)
+    //   noise:   E ≈ σ²          (window-length independent — always ≈ σ²)
+    // This makes the fractions E_late/E_total, E_mid/E_total signal-ratio
+    // quantities with the same thresholds as the old per-block approach while
+    // providing ~20× better SNR from the narrower effective DFT bandwidth.
+    float e_early_g = goertzel(m_earlyRaw.data(), m_earlyFill, 100.0f, m_sampleRate);
+    float e_mid_g   = goertzel(m_midRaw.data(),   m_midFill,   100.0f, m_sampleRate);
+    float e_late_g  = goertzel(m_lateRaw.data(),  m_lateFill,  100.0f, m_sampleRate);
 
-    // Noise reference: scale the 6-block tail measurement to an 80-block window.
-    float noise_800 = m_noiseFloor100 * (80.0f / 6.0f);
-    float snr_total = (noise_800 > 1e-12f) ? (e_total / noise_800) : 0.0f;
+    float E_early = e_early_g * (float)m_earlyFill;
+    float E_mid   = e_mid_g   * (float)m_midFill;
+    float E_late  = e_late_g  * (float)m_lateFill;
+    float E_total = E_early + E_mid + E_late;
+
+    // Noise reference: m_noiseFloor100 is the EMA of E_noise ≈ σ².
+    // Each of the three sub-windows contributes ~σ² noise, so total noise ≈ 3σ².
+    float noise_ref = m_noiseFloor100 * 3.0f;
+    float snr_total = (noise_ref > 1e-15f) ? (E_total / noise_ref) : 0.0f;
 
     int type;
     if (snr_total < k_snrMin) {
         type = BIT_MISSING;
     } else {
-        float late_frac = e_late / e_total;
-        float mid_frac  = e_mid  / e_total;
+        float late_frac = (E_total > 0.0f) ? E_late / E_total : 0.0f;
+        float mid_frac  = (E_total > 0.0f) ? E_mid  / E_total : 0.0f;
 
         if      (late_frac > k_lateFrac) type = BIT_MARKER;
         else if (mid_frac  > k_midFrac)  type = BIT_ONE;
@@ -330,15 +354,10 @@ void WwvDecoder::onWindowClose(std::chrono::steady_clock::time_point tickTime)
 /* ── trySyncAndDecode ────────────────────────────────────────────────────── */
 bool WwvDecoder::trySyncAndDecode()
 {
-    // Try each of the 60 possible frame starting positions in the ring buffer.
-    // The buffer holds k_bufSize bits; we only have m_bitCount bits total but
-    // at most k_bufSize stored.  Use min(m_bitCount, k_bufSize) as the window.
     int avail = (m_bitCount < k_bufSize) ? m_bitCount : k_bufSize;
     if (avail < 60) return false;
 
-    // Only try starting positions where a full 60-bit frame fits in the buffer.
-    // Scan newest-to-oldest so that the most recent (and most reliable) alignment
-    // wins rather than a stale match from two minutes ago.
+    // Scan newest-to-oldest so the most recent alignment wins.
     int maxStart = avail - 60;
     for (int start = maxStart; start >= 0; --start) {
         if (decodeFrame(start)) return true;

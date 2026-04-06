@@ -137,19 +137,32 @@ private:
     // near background; false triggers from harmonics have p100 >> background.
     float m_background100 = 1e-3f; // slow EMA of 100 Hz noise floor
 
-    // --- Energy integration: per-second 100 Hz power accumulators ----------
-    // Three fixed sub-windows after each tick, filled with raw Goertzel power:
-    //   early : blocks  3–22  =  30–230 ms  (20 blocks)
+    // --- Energy integration: full-window coherent Goertzel ------------------
+    // Raw audio samples for each sub-window after each tick:
+    //   early : blocks  3–22  =  30–230 ms  (20 blocks = 20×blockSize samples)
     //   mid   : blocks 23–52  = 230–530 ms  (30 blocks)
     //   late  : blocks 53–82  = 530–830 ms  (30 blocks)
-    // Classification fires at block 83 (830 ms post-tick).
-    // A noise tail window at blocks 92–97 (920–980 ms) updates the rolling
-    // noise floor, which is used as the SNR reference at classification time.
-    float m_accEarly      = 0.0f;  // accumulated 100 Hz energy: 30–230 ms
-    float m_accMid        = 0.0f;  // accumulated 100 Hz energy: 230–530 ms
-    float m_accLate       = 0.0f;  // accumulated 100 Hz energy: 530–830 ms
-    float m_accNoise      = 0.0f;  // accumulated 100 Hz energy: noise tail
-    float m_noiseFloor100 = 1e-5f; // rolling EMA of per-second noise tail energy
+    //   noise : blocks 92–97  = 920–980 ms  (6 blocks)
+    // At each window boundary a single coherent Goertzel is run over the entire
+    // accumulated buffer.  This narrows the effective 100 Hz bin from ±50 Hz
+    // (10 ms block) to ±2.5 Hz (200 ms window), reducing broadband-noise
+    // contamination by ~20× and improving SNR by the same factor.
+    //
+    // Coherent energy: E = goertzel_power × n_samples.
+    //   For a pure tone (amplitude A):  E = n × A²/4   (grows with window)
+    //   For broadband noise (variance σ²): E ≈ σ²       (window-independent)
+    // This makes E an unbiased estimator of σ² for pure noise and an
+    // amplitude-independent SNR reference for the noise floor EMA.
+    std::vector<float> m_earlyRaw;  // raw samples: bat  3–22
+    std::vector<float> m_midRaw;    // raw samples: bat 23–52
+    std::vector<float> m_lateRaw;   // raw samples: bat 53–82
+    std::vector<float> m_noiseRaw;  // raw samples: bat 92–97
+    int   m_earlyFill = 0;
+    int   m_midFill   = 0;
+    int   m_lateFill  = 0;
+    int   m_noiseFill = 0;
+    // Rolling EMA of coherent noise energy E_noise (≈ σ² for broadband noise).
+    float m_noiseFloor100 = 1e-5f;
 
     // --- bit ring buffer ---
     static constexpr int k_bufSize  = 120; // 2 minutes of bits
