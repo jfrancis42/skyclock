@@ -85,6 +85,13 @@ public:
     using BitCallback = std::function<void(int type, int ms)>;
     void setBitCallback(BitCallback cb) { m_bitCb = std::move(cb); }
 
+    // Callback invoked (from audio thread) on each genuine 1 kHz tick rising
+    // edge.  tickTime is the audio-derived steady_clock timestamp of the tick,
+    // already compensated for audio pipeline latency via setAudioLatency().
+    // This fires only on real second boundaries (not free-running predictions).
+    using TickCallback = std::function<void(std::chrono::steady_clock::time_point)>;
+    void setTickCallback(TickCallback cb) { m_tickCb = std::move(cb); }
+
     // When enabled (default: true), decoded frames are rejected unless the
     // decoded UTC time is within 25 hours of the system clock.  Disable for
     // file-based debugging where the recording may be from a different date.
@@ -205,4 +212,5 @@ private:
 
     FrameCallback m_frameCb;
     BitCallback   m_bitCb;
+    TickCallback  m_tickCb;
 };
