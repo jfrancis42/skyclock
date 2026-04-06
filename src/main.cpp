@@ -123,7 +123,7 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
     printBar(sig, snrDb);
     printf(" SNR:%4.1f dB   %lld kHz\033[K\n", snrDb, freqKhz);
 
-    // Line 2 — bit stream (searching) or decoded UTC time (locked)
+    // Line 2 — bit stream (searching) or decoded UTC time
     if (utc == 0) {
         printf("\033[33m[%s]\033[0m  %d bit%s\033[K\n",
                g_bitRow, g_bitPos, g_bitPos == 1 ? "" : "s");
@@ -134,8 +134,12 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
 #else
         gmtime_r(&utc, &t);
 #endif
-        printf("\033[1m%04d-%02d-%02d %02d:%02d:%02d UTC\033[0m"
+        bool confirmed = (f.confidence >= minConf);
+        // Confirmed: bold white.  Candidate: dim yellow to signal uncertainty.
+        const char* timeColor = confirmed ? "\033[1m" : "\033[33m";
+        printf("%s%04d-%02d-%02d %02d:%02d:%02d UTC\033[0m"
                "  Day %03d  UT1%+.1fs  [conf:%d]\033[K\n",
+               timeColor,
                t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                t.tm_hour, t.tm_min, t.tm_sec,
                f.dayOfYear, f.ut1Seconds, f.confidence);
@@ -146,9 +150,13 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
         printf("\033[33mSearching for WWV signal...\033[0m\033[K\n");
     } else if (clockSet) {
         printf("\033[1m\033[32mLOCKED\033[0m  — clock set successfully\033[K\n");
-    } else {
+    } else if (f.confidence >= minConf) {
         printf("\033[1m\033[32mLOCKED\033[0m"
                "  [conf: %d / %d needed]\033[K\n", f.confidence, minConf);
+    } else {
+        printf("\033[33mCandidate\033[0m"
+               "  — unconfirmed  [conf: %d / %d needed]\033[K\n",
+               f.confidence, minConf);
     }
 
     fflush(stdout);
