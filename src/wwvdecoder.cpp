@@ -526,7 +526,7 @@ bool WwvDecoder::decodeFrame(int startOffset)
     m_p0Valid    = true;
 
     // Only emit via callback once the streak meets the minimum.
-    if (m_consecutiveGood >= k_minConsecutiveGood) {
+    if (m_consecutiveGood >= m_minConsecutiveGood) {
         if (m_frameCb) m_frameCb(m_frame);
     }
     return true;
