@@ -68,6 +68,25 @@ static std::mutex  g_frameMutex;
 static WwvTime     g_latestFrame;
 static bool        g_frameUpdated = false;
 
+/* ── Tick-sync state (audio thread → main thread) ────────────────────────── */
+struct TickSnap {
+    bool   hasAnchor       = false;
+    std::chrono::steady_clock::time_point anchorSteady; // steady time of first tick
+    time_t anchorUtc       = 0;    // UTC assigned to anchorSteady
+    std::chrono::steady_clock::time_point lastTick;
+    time_t lastTickUtc     = 0;    // estimated UTC at lastTick
+    int    tickCount       = 0;
+    bool   pendingSet      = false; // minute boundary identified, pending clock set
+    time_t pendingUtc      = 0;
+    std::chrono::steady_clock::time_point pendingTick;
+    bool   boundaryFound   = false; // minute boundary has been identified (latches)
+    time_t boundaryUtc     = 0;
+    bool   clockSet        = false; // system clock was set successfully
+    bool   useSystemAnchor = false; // anchor from system clock, not --time
+};
+static TickSnap   g_tickSnap;
+static std::mutex g_tickMutex;
+
 /* ── TTY display state ───────────────────────────────────────────────────── */
 // Sliding window of the last 60 classified bits as printable chars.
 // Written only by the audio-thread bit callback; memmove of 59 bytes and
@@ -192,6 +211,121 @@ static void listDevices()
     Pa_Terminate();
 }
 
+/* ── Tick-sync helpers ───────────────────────────────────────────────────── */
+
+// Parse "HH:MM" or "HH:MM:SS" (UTC) into a time_t using today's UTC date.
+// If seconds are omitted, falls back to the current system clock's second.
+// Returns 0 on failure.
+static time_t parseUtcTime(const char* str)
+{
+    int h = 0, m = 0, s = -1;
+    if (sscanf(str, "%d:%d:%d", &h, &m, &s) < 2
+        || h < 0 || h > 23 || m < 0 || m > 59 || (s >= 0 && s > 59))
+        return 0;
+    time_t now = std::time(nullptr);
+    struct tm t = {};
+#ifdef _WIN32
+    gmtime_s(&t, &now);
+#else
+    gmtime_r(&now, &t);
+#endif
+    t.tm_hour = h;
+    t.tm_min  = m;
+    t.tm_sec  = (s >= 0) ? s : (int)(now % 60); // fall back to system seconds
+#ifdef _WIN32
+    return _mkgmtime(&t);
+#else
+    return timegm(&t);
+#endif
+}
+
+// Redraw the tick-sync 3-line status panel.
+static void drawTickDisplay(bool first, float sig, long long freqKhz,
+                            const TickSnap& ts)
+{
+    if (!first)
+        printf("\033[%dA\r", kDisplayLines);
+
+    float snrDb = (sig < 0.9999f) ? -10.0f * log10f(1.0f - sig) : 30.0f;
+    printf("\033[1mskyclock " SC_VERSION "\033[0m   ");
+    printBar(sig, snrDb);
+    printf(" SNR:%4.1f dB   %lld kHz\033[K\n", snrDb, freqKhz);
+
+    if (!ts.hasAnchor) {
+        printf("\033[33mNo ticks detected yet...\033[0m\033[K\n");
+        printf("\033[33mSearching for WWV 1 kHz ticks...\033[0m\033[K\n");
+    } else {
+        // Line 2: current estimated UTC
+        double secSince = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - ts.lastTick).count();
+        time_t estNow = ts.lastTickUtc + (time_t)secSince;
+        struct tm t = {};
+#ifdef _WIN32
+        gmtime_s(&t, &estNow);
+#else
+        gmtime_r(&estNow, &t);
+#endif
+        const char* bold  = ts.clockSet ? "\033[1m" : "";
+        const char* label = ts.useSystemAnchor
+                          ? "  \033[2m(system-clock anchor)\033[0m" : "";
+        printf("%s%04d-%02d-%02d %02d:%02d:%02d UTC\033[0m"
+               "  [ticks: %d]%s\033[K\n",
+               bold,
+               t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+               t.tm_hour, t.tm_min, t.tm_sec,
+               ts.tickCount, label);
+
+        // Line 3: countdown or locked status
+        if (ts.clockSet) {
+            struct tm tb = {};
+            time_t bu = ts.boundaryUtc;
+#ifdef _WIN32
+            gmtime_s(&tb, &bu);
+#else
+            gmtime_r(&bu, &tb);
+#endif
+            printf("\033[1m\033[32mLOCKED\033[0m"
+                   "  — clock set to %02d:%02d:%02d UTC"
+                   " (tick-sync)\033[K\n",
+                   tb.tm_hour, tb.tm_min, tb.tm_sec);
+        } else if (ts.boundaryFound) {
+            // Compute the precise UTC the clock would have been set to right now
+            // (boundary UTC + elapsed since tick).  Updates every redraw so the
+            // user can see the running timestamp even without root privileges.
+            auto elaps   = std::chrono::steady_clock::now() - ts.pendingTick;
+            auto wh      = std::chrono::system_clock::from_time_t(ts.boundaryUtc)
+                         + std::chrono::duration_cast<
+                               std::chrono::system_clock::duration>(elaps);
+            time_t whSec = std::chrono::system_clock::to_time_t(wh);
+            int    whMs  = (int)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               wh.time_since_epoch()).count() % 1000);
+            struct tm tw = {};
+#ifdef _WIN32
+            gmtime_s(&tw, &whSec);
+#else
+            gmtime_r(&whSec, &tw);
+#endif
+            printf("\033[33mWould set: %02d:%02d:%02d.%03d UTC\033[0m"
+                   "  (run as root, or enable setSystemClock)\033[K\n",
+                   tw.tm_hour, tw.tm_min, tw.tm_sec, whMs);
+        } else {
+            int secsToNext = (int)(60 - ts.lastTickUtc % 60);
+            if (secsToNext == 60) secsToNext = 0;
+            time_t nxt = (ts.lastTickUtc / 60 + 1) * 60;
+            struct tm tnm = {};
+#ifdef _WIN32
+            gmtime_s(&tnm, &nxt);
+#else
+            gmtime_r(&nxt, &tnm);
+#endif
+            const char* need = (ts.tickCount < 3) ? "need 3 ticks" : "waiting...";
+            printf("Next minute: %02d:%02d:00 UTC  (%d s)  [%s]\033[K\n",
+                   tnm.tm_hour, tnm.tm_min, secsToNext, need);
+        }
+    }
+    fflush(stdout);
+}
+
 /* ── Help ────────────────────────────────────────────────────────────────── */
 static void printHelp(const char* argv0)
 {
@@ -202,6 +336,11 @@ static void printHelp(const char* argv0)
     printf("  --file <path> --realtime\n");
     printf("                         Decode audio file at real-time speed\n");
     printf("                         (simulates a live radio; shows status panel)\n");
+    printf("  --time <HH:MM[:SS]>    Current UTC time (enables tick-sync clock set)\n");
+    printf("                         Include seconds for best accuracy.\n");
+    printf("                         Omit seconds to use the system clock's second.\n");
+    printf("  --full-decode          Full BCD time-code decode mode (requires a clean,\n");
+    printf("                         low-noise signal and two consecutive clean minutes)\n");
     printf("  --rigctld              Connect to rigctld to tune the radio\n");
     printf("  --rigctld-host <host>  rigctld hostname or IP  (default: localhost)\n");
     printf("  --rigctld-port <port>  rigctld TCP port         (default: 4532)\n");
@@ -233,8 +372,10 @@ int main(int argc, char* argv[])
     bool listDev  = false;
     bool listRigs = false;
     bool realtime = false;
+    bool fullDecode = false;          // --full-decode: BCD mode instead of tick-sync
     std::string deviceName;
     std::string filePath;
+    std::string timeArg;              // --time HH:MM[:SS]
     bool        rigctldOverride = false;  // --rigctld flag seen on CLI
     std::string rigctldHostArg;           // --rigctld-host <h>
     int         rigctldPortArg  = 0;      // --rigctld-port <p>
@@ -255,6 +396,10 @@ int main(int argc, char* argv[])
             filePath = argv[++i];
         } else if (!strcmp(argv[i], "--realtime")) {
             realtime = true;
+        } else if (!strcmp(argv[i], "--full-decode")) {
+            fullDecode = true;
+        } else if (!strcmp(argv[i], "--time") && i + 1 < argc) {
+            timeArg = argv[++i];
         } else if (!strcmp(argv[i], "--rigctld")) {
             rigctldOverride = true;
         } else if (!strcmp(argv[i], "--rigctld-host") && i + 1 < argc) {
@@ -561,16 +706,73 @@ int main(int argc, char* argv[])
     WwvDecoder decoder(sampleRate);
     g_decoder = &decoder;
 
-    decoder.setFrameCallback([&](const WwvTime& frame) {
-        std::lock_guard<std::mutex> lk(g_frameMutex);
-        g_latestFrame  = frame;
-        g_frameUpdated = true;
-    });
+    // ── Mode-specific setup ────────────────────────────────────────────────
+    if (fullDecode) {
+        // BCD decode mode: full time-code decode from the 100 Hz subcarrier.
+        decoder.setFrameCallback([&](const WwvTime& frame) {
+            std::lock_guard<std::mutex> lk(g_frameMutex);
+            g_latestFrame  = frame;
+            g_frameUpdated = true;
+        });
+        decoder.setBitCallback([](int type, int /*ms*/) {
+            appendBitDisplay(type);
+        });
+    } else {
+        // Tick-sync mode: use 1 kHz tick rising edges to identify the minute
+        // boundary, then set the clock with sub-second precision.
+        //
+        // UTC anchor: from --time HH:MM[:SS] if provided, otherwise from the
+        // system clock at the moment of the first tick (works if the system
+        // clock is within ±29 s of real UTC).
+        time_t anchorUtc = 0;
+        if (!timeArg.empty()) {
+            anchorUtc = parseUtcTime(timeArg.c_str());
+            if (anchorUtc == 0) {
+                fprintf(stderr,
+                        "Invalid --time value '%s'. Use HH:MM or HH:MM:SS (UTC).\n",
+                        timeArg.c_str());
+                Pa_Terminate(); return 1;
+            }
+            printf("Tick-sync anchor: %s UTC\n", timeArg.c_str());
+        } else {
+            printf("Tick-sync mode — no --time given; anchoring to system clock.\n"
+                   "  For accuracy, provide --time HH:MM:SS (current UTC).\n");
+        }
 
-    // Bit callback: update the sliding display row (audio thread).
-    decoder.setBitCallback([](int type, int /*ms*/) {
-        appendBitDisplay(type);
-    });
+        decoder.setTickCallback(
+            [anchorUtc](std::chrono::steady_clock::time_point tickTime) {
+                std::lock_guard<std::mutex> lk(g_tickMutex);
+                TickSnap& ts = g_tickSnap;
+                if (ts.clockSet || ts.boundaryFound) return;
+
+                if (!ts.hasAnchor) {
+                    ts.anchorSteady    = tickTime;
+                    ts.useSystemAnchor = (anchorUtc == 0);
+                    ts.anchorUtc       = (anchorUtc != 0)
+                                       ? anchorUtc
+                                       : std::time(nullptr);
+                    ts.hasAnchor = true;
+                }
+
+                double elapsed = std::chrono::duration<double>(
+                    tickTime - ts.anchorSteady).count();
+                time_t estUtc = ts.anchorUtc +
+                                static_cast<time_t>(std::round(elapsed));
+
+                ++ts.tickCount;
+                ts.lastTick    = tickTime;
+                ts.lastTickUtc = estUtc;
+
+                // After ≥3 ticks, trigger on the first minute boundary.
+                if (ts.tickCount >= 3 && estUtc % 60 == 0) {
+                    ts.pendingSet    = true;
+                    ts.boundaryFound = true;
+                    ts.pendingUtc    = estUtc;
+                    ts.boundaryUtc   = estUtc;
+                    ts.pendingTick   = tickTime;
+                }
+            });
+    }
 
     // ── Open audio stream ──────────────────────────────────────────────────
     PaStreamParameters inParams{};
@@ -603,35 +805,87 @@ int main(int argc, char* argv[])
     printf("Listening. Press Ctrl+C to stop.\n");
 
     // ── Main display loop ──────────────────────────────────────────────────
-    bool clockSet = false;
+    if (fullDecode) {
+        // BCD decode display loop
+        bool clockSet = false;
+        drawDisplay(true, 0.0f, 0, WwvTime{}, false, cfg.freqKhz, cfg.minConfidence);
 
-    // Print initial display block
-    drawDisplay(true, 0.0f, 0, WwvTime{}, false, cfg.freqKhz, cfg.minConfidence);
+        while (g_running.load()) {
+            Pa_Sleep(200);
 
-    while (g_running.load()) {
-        Pa_Sleep(200);
+            {
+                std::lock_guard<std::mutex> lk(g_frameMutex);
+                g_frameUpdated = false;  // consumed
+            }
 
-        {
-            std::lock_guard<std::mutex> lk(g_frameMutex);
-            g_frameUpdated = false;  // consumed
+            time_t  utc = decoder.currentUtc();
+            float   sig = decoder.signalLevel();
+            WwvTime f   = decoder.lastFrame();
+            g_smoothSig = 0.94f * g_smoothSig + 0.06f * sig;
+
+            drawDisplay(false, g_smoothSig, utc, f, clockSet,
+                        cfg.freqKhz, cfg.minConfidence);
+
+            if (cfg.setSystemClock && !clockSet && utc != 0 &&
+                f.confidence >= cfg.minConfidence) {
+                std::string clockErr;
+                if (setSystemClock(decoder.currentUtcPoint(), clockErr))
+                    clockSet = true;
+                else
+                    fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
+                drawDisplay(false, g_smoothSig, utc, f, clockSet,
+                            cfg.freqKhz, cfg.minConfidence);
+            }
         }
+    } else {
+        // Tick-sync display loop
+        drawTickDisplay(true, 0.0f, cfg.freqKhz, TickSnap{});
 
-        time_t  utc = decoder.currentUtc();
-        float   sig = decoder.signalLevel();
-        WwvTime f   = decoder.lastFrame();
-        g_smoothSig = 0.94f * g_smoothSig + 0.06f * sig;
+        while (g_running.load()) {
+            Pa_Sleep(200);
 
-        drawDisplay(false, g_smoothSig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+            // Drain any pending clock-set request (minute boundary identified
+            // by the audio thread).
+            bool   doSet   = false;
+            time_t setUtc  = 0;
+            std::chrono::steady_clock::time_point setTick;
+            {
+                std::lock_guard<std::mutex> lk(g_tickMutex);
+                if (g_tickSnap.pendingSet && !g_tickSnap.clockSet) {
+                    doSet              = true;
+                    setUtc             = g_tickSnap.pendingUtc;
+                    setTick            = g_tickSnap.pendingTick;
+                    g_tickSnap.pendingSet = false;
+                }
+            }
+            if (doSet) {
+                if (cfg.setSystemClock) {
+                    auto elapsed = std::chrono::steady_clock::now() - setTick;
+                    auto utcNow  = std::chrono::system_clock::from_time_t(setUtc)
+                                 + std::chrono::duration_cast<
+                                       std::chrono::system_clock::duration>(elapsed);
+                    std::string clockErr;
+                    if (setSystemClock(utcNow, clockErr)) {
+                        std::lock_guard<std::mutex> lk(g_tickMutex);
+                        g_tickSnap.clockSet = true;
+                    } else {
+                        fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
+                    }
+                } else {
+                    // setSystemClock disabled — boundary is already recorded;
+                    // display will show the running "would set to" timestamp.
+                }
+            }
 
-        if (cfg.setSystemClock && !clockSet && utc != 0 &&
-            f.confidence >= cfg.minConfidence) {
-            std::string clockErr;
-            if (setSystemClock(decoder.currentUtcPoint(), clockErr))
-                clockSet = true;
-            else
-                fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
-            // Redraw immediately to reflect updated clock-set status
-            drawDisplay(false, g_smoothSig, utc, f, clockSet, cfg.freqKhz, cfg.minConfidence);
+            float sig = decoder.signalLevel();
+            g_smoothSig = 0.94f * g_smoothSig + 0.06f * sig;
+
+            TickSnap tsCopy;
+            {
+                std::lock_guard<std::mutex> lk(g_tickMutex);
+                tsCopy = g_tickSnap;
+            }
+            drawTickDisplay(false, g_smoothSig, cfg.freqKhz, tsCopy);
         }
     }
 

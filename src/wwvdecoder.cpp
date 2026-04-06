@@ -185,6 +185,7 @@ void WwvDecoder::processBlock(const float* block)
         m_earlyFill = m_midFill = m_lateFill = m_noiseFill = 0;
         m_lastTickBlock = m_totalBlocks;
         m_lastTickTime  = blockTime;
+        if (m_tickCb) m_tickCb(blockTime);
     }
     m_tickLastBlock = tickNow;
 
