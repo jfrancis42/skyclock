@@ -189,18 +189,25 @@ static void printHelp(const char* argv0)
 {
     printf("skyclock %s — WWV time code decoder\n\n", SC_VERSION);
     printf("Usage: %s [OPTIONS]\n\n", argv0);
-    printf("  --device <name>      Use named PortAudio audio input device\n");
-    printf("  --file <path>        Fast decode from audio file (debug mode)\n");
+    printf("  --device <name>        Use named PortAudio audio input device\n");
+    printf("  --file <path>          Fast decode from audio file (debug mode)\n");
     printf("  --file <path> --realtime\n");
-    printf("                       Decode audio file at real-time speed\n");
-    printf("                       (simulates a live radio; shows status panel)\n");
-    printf("  --list-devices       List available audio input devices and exit\n");
-    printf("  --list-rigs          List available hamlib rig models and exit\n");
-    printf("  --version            Print version and exit\n");
-    printf("  --help               This help\n\n");
+    printf("                         Decode audio file at real-time speed\n");
+    printf("                         (simulates a live radio; shows status panel)\n");
+    printf("  --rigctld              Connect to rigctld to tune the radio\n");
+    printf("  --rigctld-host <host>  rigctld hostname or IP  (default: localhost)\n");
+    printf("  --rigctld-port <port>  rigctld TCP port         (default: 4532)\n");
+    printf("  --freq-khz <khz>       Override WWV receive frequency in kHz\n");
+    printf("  --list-devices         List available audio input devices and exit\n");
+    printf("  --list-rigs            List available hamlib rig models and exit\n");
+    printf("  --version              Print version and exit\n");
+    printf("  --help                 This help\n\n");
     printf("Configuration: ~/.skyclock/settings.json\n");
     printf("  Key settings:\n");
-    printf("    rigEnabled         true/false  (default: false)\n");
+    printf("    rigctldEnabled     true/false  connect via rigctld (default: false)\n");
+    printf("    rigctldHost        rigctld hostname or IP  (default: \"localhost\")\n");
+    printf("    rigctldPort        rigctld TCP port        (default: 4532)\n");
+    printf("    rigEnabled         true/false  direct hamlib (default: false)\n");
     printf("    rigModel           hamlib model number\n");
     printf("    rigPort            serial port path\n");
     printf("    freqKhz            WWV frequency in kHz (2500/5000/10000/15000/20000)\n");
@@ -220,6 +227,10 @@ int main(int argc, char* argv[])
     bool realtime = false;
     std::string deviceName;
     std::string filePath;
+    bool        rigctldOverride = false;  // --rigctld flag seen on CLI
+    std::string rigctldHostArg;           // --rigctld-host <h>
+    int         rigctldPortArg  = 0;      // --rigctld-port <p>
+    long long   freqKhzArg      = 0;      // --freq-khz <f>  (0 = use settings)
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -236,6 +247,14 @@ int main(int argc, char* argv[])
             filePath = argv[++i];
         } else if (!strcmp(argv[i], "--realtime")) {
             realtime = true;
+        } else if (!strcmp(argv[i], "--rigctld")) {
+            rigctldOverride = true;
+        } else if (!strcmp(argv[i], "--rigctld-host") && i + 1 < argc) {
+            rigctldHostArg = argv[++i];
+        } else if (!strcmp(argv[i], "--rigctld-port") && i + 1 < argc) {
+            rigctldPortArg = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--freq-khz") && i + 1 < argc) {
+            freqKhzArg = atoll(argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -257,6 +276,13 @@ int main(int argc, char* argv[])
     }
 
     Settings& cfg = Settings::instance();
+
+    // Apply CLI overrides (these win over settings.json values).
+    if (rigctldOverride)      cfg.rigctldEnabled = true;
+    if (!rigctldHostArg.empty()) cfg.rigctldHost = rigctldHostArg;
+    if (rigctldPortArg > 0)   cfg.rigctldPort   = rigctldPortArg;
+    if (freqKhzArg > 0)       cfg.freqKhz       = freqKhzArg;
+
     cfg.save();
 
     bool isTty = isatty(fileno(stdout)) != 0;
@@ -278,6 +304,8 @@ int main(int argc, char* argv[])
 
         WwvDecoder decoder(kSR);
         g_decoder = &decoder;
+        // File mode: recording may be from a different date — skip time check.
+        decoder.setTimePlausibilityCheck(false);
 
         decoder.setFrameCallback([&](const WwvTime& frame) {
             std::lock_guard<std::mutex> lk(g_frameMutex);
@@ -366,6 +394,8 @@ int main(int argc, char* argv[])
 
         WwvDecoder decoder(kSR);
         g_decoder = &decoder;
+        // File mode: recording may be from a different date — skip time check.
+        decoder.setTimePlausibilityCheck(false);
 
         decoder.setFrameCallback([&](const WwvTime& frame) {
             std::lock_guard<std::mutex> lk(g_frameMutex);
@@ -445,7 +475,19 @@ int main(int argc, char* argv[])
         fprintf(stderr, "Radio: %s\n", e.c_str());
     });
 
-    if (cfg.rigEnabled) {
+    if (cfg.rigctldEnabled) {
+        // Connect via rigctld (hamlib network daemon).
+        printf("Radio: connecting to rigctld at %s:%d...\n",
+               cfg.rigctldHost.c_str(), cfg.rigctldPort);
+        if (rig.connectRigctld(cfg.rigctldHost, cfg.rigctldPort)) {
+            printf("Radio: connected to rigctld\n");
+            rig.setFreqHz(cfg.freqKhz * 1000LL);
+            rig.setMode(cfg.rigMode);
+            printf("Radio: tuned to %lld kHz %s\n",
+                   cfg.freqKhz, cfg.rigMode.c_str());
+        }
+    } else if (cfg.rigEnabled) {
+        // Connect via direct hamlib (serial/USB).
         RigConfig rcfg;
         rcfg.model     = cfg.rigModel;
         rcfg.port      = cfg.rigPort;

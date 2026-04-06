@@ -23,7 +23,7 @@
  *         total = e_early + e_mid + e_late
  *         if total < SNR_MIN × noise_800 → MISSING
  *         elif e_late / total > 0.28     → MARKER  (energy persists to 830 ms)
- *         elif e_mid  / total > 0.28     → ONE     (energy persists to 530 ms)
+ *         elif e_mid  / total > 0.33     → ONE     (energy persists to 530 ms)
  *         else                           → ZERO    (energy ends by 230 ms)
  *
  *       This approach accumulates evidence across the full bit period, so HF
@@ -76,7 +76,7 @@ static constexpr float k_snrMin      = 2.0f;
 // Fraction of total energy in the late or mid sub-window that divides the
 // three bit types.  Derived from Python energy analysis on wwv-noisy.opus.
 static constexpr float k_lateFrac    = 0.28f; // late_frac > this → MARKER
-static constexpr float k_midFrac     = 0.28f; // mid_frac  > this → ONE
+static constexpr float k_midFrac     = 0.33f; // mid_frac  > this → ONE
 
 /* ── Constructor ─────────────────────────────────────────────────────────── */
 WwvDecoder::WwvDecoder(float sampleRate)
@@ -200,7 +200,7 @@ void WwvDecoder::processBlock(const float* block)
     // windows away from the true second boundary.  The prediction uses the last
     // confirmed tick as a phase anchor and drifts only with the audio clock.
     int bat_predict = m_totalBlocks - m_lastTickBlock;
-    if (m_lastTickBlock > 0 && bat_predict == 100 && !tickNow) {
+    if (m_lastTickBlock > 0 && bat_predict == k_predDelay && !tickNow) {
         // Real tick didn't arrive — advance prediction.
         m_accEarly = 0.0f;
         m_accMid   = 0.0f;
@@ -337,8 +337,10 @@ bool WwvDecoder::trySyncAndDecode()
     if (avail < 60) return false;
 
     // Only try starting positions where a full 60-bit frame fits in the buffer.
+    // Scan newest-to-oldest so that the most recent (and most reliable) alignment
+    // wins rather than a stale match from two minutes ago.
     int maxStart = avail - 60;
-    for (int start = 0; start <= maxStart; ++start) {
+    for (int start = maxStart; start >= 0; --start) {
         if (decodeFrame(start)) return true;
     }
 
@@ -371,21 +373,37 @@ bool WwvDecoder::decodeFrame(int startOffset)
     if (missingCount > 30) return false;
 
     // 1. Verify markers at expected positions.
-    // ZERO or ONE at a marker position is a definitive alignment failure.
+    // Under HF flutter fading, position markers (P1–P5) sometimes appear one
+    // second late: the 100 Hz subcarrier fades through the late sub-window of
+    // the true second, then recovers and fires strongly in the early+mid windows
+    // of the following second.  Accept a MARKER at mp+1 as evidence of mp.
     // MISSING (HF dropout on e.g. P0) is tolerated up to once per frame;
-    // the BCD range checks below provide additional false-positive rejection.
-    int markerMissing = 0;
+    // the BCD range checks and temporal consistency gate provide additional
+    // false-positive rejection.
+    int  markerMissing = 0;
+    bool lateMarker[60] = {};   // lateMarker[mp+1] = true when mp arrived late
     for (int mp : k_markerSecs) {
         int b = bit(mp);
         if (b == BIT_MARKER) continue;
+        // Late-marker: the MARKER arrived one second after the expected position.
+        if (mp + 1 < 60 && bit(mp + 1) == BIT_MARKER) {
+            lateMarker[mp + 1] = true;
+            continue;
+        }
         if (b == BIT_MISSING) { ++markerMissing; continue; }
-        return false; // ZERO or ONE at a marker position
+        return false; // ZERO or ONE at marker position with no late evidence
     }
-    if (markerMissing > 1) return false;
+    if (markerMissing > 2) return false;
 
-    // 2. Reject frames where "always-zero" positions are markers
+    // 2. Reject frames where "always-zero" positions are markers.
+    // Late-marker positions (e.g. position 10 when P1 arrived late) are exempt.
+    // Allow at most one unexplained violation for robustness under heavy fading.
+    int zeroViolations = 0;
     for (int zp : k_zeroSecs) {
-        if (bit(zp) == BIT_MARKER) return false;
+        if (lateMarker[zp]) continue;
+        if (bit(zp) == BIT_MARKER) {
+            if (++zeroViolations > 1) return false;
+        }
     }
 
     // ── Decode minutes ─────────────────────────────────────────────────────
@@ -409,8 +427,39 @@ bool WwvDecoder::decodeFrame(int startOffset)
     // ── Decode year (last 2 digits) ────────────────────────────────────────
     int ytens  = bval(45)*8 + bval(46)*4 + bval(47)*2 + bval(48)*1;
     int yunits = bval(50)*8 + bval(51)*4 + bval(52)*2 + bval(53)*1;
+    // Reject invalid BCD digits individually (each must be 0–9).
+    if (ytens > 9 || yunits > 9) return false;
     int year2  = ytens * 10 + yunits;
-    if (year2 < 0 || year2 > 99) return false;
+
+    // ── Time plausibility gate ─────────────────────────────────────────────
+    // Reject frames whose decoded UTC is more than 25 hours from the system
+    // clock.  Catches noise frames that pass BCD range checks but decode to
+    // implausible dates (e.g. year 2001 when the system is in 2025).
+    // Disable via setTimePlausibilityCheck(false) when replaying old recordings.
+    if (m_timePlausibility) {
+        // Build a UTC unix timestamp from the decoded BCD fields.
+        int fullYear = 2000 + year2;
+        static const int days_norm[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        static const int days_leap[] = {31,29,31,30,31,30,31,31,30,31,30,31};
+        bool leap = (fullYear % 4 == 0 && fullYear % 100 != 0) || (fullYear % 400 == 0);
+        const int* dim = leap ? days_leap : days_norm;
+        int month = 1, dayOfMonth = doy;
+        for (int m2 = 0; m2 < 12 && dayOfMonth > dim[m2]; ++m2) {
+            dayOfMonth -= dim[m2]; month = m2 + 2;
+        }
+        struct tm tmv = {};
+        tmv.tm_year = fullYear - 1900; tmv.tm_mon = month - 1;
+        tmv.tm_mday = dayOfMonth; tmv.tm_hour = hour; tmv.tm_min = minute;
+#ifdef _WIN32
+        time_t decoded = _mkgmtime(&tmv);
+#else
+        time_t decoded = timegm(&tmv);
+#endif
+        time_t now = std::time(nullptr);
+        if (std::abs(static_cast<double>(decoded) - static_cast<double>(now))
+                > 25.0 * 3600.0)
+            return false;
+    }
 
     // ── Decode UT1 correction ──────────────────────────────────────────────
     bool   ut1Positive = (bit(38) == BIT_ONE);
@@ -421,7 +470,26 @@ bool WwvDecoder::decodeFrame(int startOffset)
     int  dst = bval(55)*2 + bval(56)*1;
     bool lsw = (bit(57) == BIT_ONE);
 
-    // ── All checks passed — record the decoded frame ───────────────────────
+    // ── All checks passed — temporal consistency gate ──────────────────────
+    // A single frame that clears BCD range checks is still fallible (random
+    // noise can produce plausible-looking BCD).  Require that successive frames
+    // are ~60 s apart (as measured by the audio-clock P0 timestamps) before
+    // we trust the decode and invoke the frame callback.
+    auto currentP0 = ts(0);
+    bool temporalOk = false;
+    if (m_consecutiveGood > 0) {
+        double dt = std::chrono::duration<double>(currentP0 - m_prevP0Time).count();
+        // Accept ±2.5 s around the expected 60-second frame interval.
+        temporalOk = (dt > 57.5 && dt < 62.5);
+    }
+
+    if (temporalOk) {
+        ++m_consecutiveGood;
+    } else {
+        m_consecutiveGood = 1; // restart streak; this frame is the new candidate
+    }
+
+    // ── Record the decoded frame ───────────────────────────────────────────
     WwvTime t;
     t.minute              = minute;
     t.hour                = hour;
@@ -431,13 +499,17 @@ bool WwvDecoder::decodeFrame(int startOffset)
     t.dstCode             = dst;
     t.leapSecondWarning   = lsw;
     t.valid               = true;
-    t.confidence          = m_frame.valid ? m_frame.confidence + 1 : 1;
+    t.confidence          = m_consecutiveGood;
 
-    m_frame  = t;
-    m_p0Time = ts(0);  // system timestamp at P0 (start of this decoded minute)
-    m_p0Valid = true;
+    m_prevP0Time = currentP0;
+    m_frame      = t;
+    m_p0Time     = currentP0;
+    m_p0Valid    = true;
 
-    if (m_frameCb) m_frameCb(m_frame);
+    // Only emit via callback once the streak meets the minimum.
+    if (m_consecutiveGood >= k_minConsecutiveGood) {
+        if (m_frameCb) m_frameCb(m_frame);
+    }
     return true;
 }
 
