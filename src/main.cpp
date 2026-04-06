@@ -305,7 +305,10 @@ int main(int argc, char* argv[])
         WwvDecoder decoder(kSR);
         g_decoder = &decoder;
         // File mode: recording may be from a different date — skip time check.
+        // Also lower the consecutive-frame requirement to 1 so single-frame
+        // decodes are visible (useful for signal analysis).
         decoder.setTimePlausibilityCheck(false);
+        decoder.setMinConsecutiveFrames(1);
 
         decoder.setFrameCallback([&](const WwvTime& frame) {
             std::lock_guard<std::mutex> lk(g_frameMutex);
@@ -395,7 +398,9 @@ int main(int argc, char* argv[])
         WwvDecoder decoder(kSR);
         g_decoder = &decoder;
         // File mode: recording may be from a different date — skip time check.
+        // Lower consecutive-frame requirement to 1 for single-frame visibility.
         decoder.setTimePlausibilityCheck(false);
+        decoder.setMinConsecutiveFrames(1);
 
         decoder.setFrameCallback([&](const WwvTime& frame) {
             std::lock_guard<std::mutex> lk(g_frameMutex);

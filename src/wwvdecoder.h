@@ -90,6 +90,11 @@ public:
     // file-based debugging where the recording may be from a different date.
     void setTimePlausibilityCheck(bool enable) { m_timePlausibility = enable; }
 
+    // Minimum consecutive valid frames before emitting via the frame callback.
+    // Default: k_minConsecutiveGood (2).  Set to 1 in file/debug mode to see
+    // single-frame decodes without requiring temporal confirmation.
+    void setMinConsecutiveFrames(int n) { m_minConsecutiveGood = n; }
+
 private:
     // --- Goertzel tone power at freqHz over a block of n samples ---
     static float goertzel(const float* buf, int n, float freqHz, float sampleRate);
@@ -196,6 +201,7 @@ private:
     int   m_consecutiveGood = 0; // consecutive frames that passed all checks + timing
 
     bool  m_timePlausibility = true; // reject frames >25 h from system clock
+    int   m_minConsecutiveGood = k_minConsecutiveGood;
 
     FrameCallback m_frameCb;
     BitCallback   m_bitCb;
