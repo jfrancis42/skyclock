@@ -101,6 +101,40 @@ bool RigControl::connect(const RigConfig& cfg)
 #endif
 }
 
+bool RigControl::connectRigctld(const std::string& host, int port)
+{
+#ifdef HAVE_HAMLIB
+    disconnect();
+
+    m_rig = rig_init(RIG_MODEL_NETRIGCTL);
+    if (!m_rig) {
+        emitError("Failed to initialise NET rigctl backend");
+        return false;
+    }
+
+    // hamlib NET rigctl expects "host:port" in the pathname field.
+    std::string addr = host + ":" + std::to_string(port);
+    strncpy(m_rig->state.rigport.pathname, addr.c_str(), HAMLIB_FILPATHLEN - 1);
+    m_rig->state.rigport.timeout = 2000;
+    m_rig->state.pttport.type.ptt = RIG_PTT_NONE;
+
+    int ret = rig_open(m_rig);
+    if (ret != RIG_OK) {
+        emitError(std::string("rigctld connect to ") + addr + " failed: " + rigerror(ret));
+        rig_cleanup(m_rig);
+        m_rig = nullptr;
+        return false;
+    }
+
+    m_connected = true;
+    return true;
+#else
+    (void)host; (void)port;
+    emitError("Hamlib not available in this build");
+    return false;
+#endif
+}
+
 void RigControl::disconnect()
 {
 #ifdef HAVE_HAMLIB

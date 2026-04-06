@@ -9,7 +9,7 @@
  * pure C++17 (no Qt) and a hand-written flat JSON parser.
  */
 struct Settings {
-    // Rig control (mirrors CodeMonkey RigConfig fields for consistency)
+    // Rig control — direct hamlib (serial/USB)
     int         rigModel    = 1;
     std::string rigPort     = "/dev/ttyUSB0";
     int         rigBaud     = 9600;
@@ -20,6 +20,11 @@ struct Settings {
     int         rigDtrState = 0;     // 0=unset 1=on 2=off
     int         rigRtsState = 0;     // 0=unset 1=on 2=off
     bool        rigEnabled  = false; // false = no radio; user tunes manually
+
+    // Rig control — rigctld (hamlib network daemon)
+    bool        rigctldEnabled = false;
+    std::string rigctldHost    = "localhost";
+    int         rigctldPort    = 4532;
 
     // WWV reception
     long long   freqKhz     = 10000; // WWV frequency to tune (kHz); 2500/5000/10000/15000/20000

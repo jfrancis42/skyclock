@@ -5,6 +5,7 @@
 
 #ifdef HAVE_HAMLIB
 #include <hamlib/rig.h>
+#include <hamlib/riglist.h>
 #endif
 
 /**
@@ -38,7 +39,13 @@ public:
     // Returns sorted list of "ModelNum — Manufacturer Name" strings.
     static std::vector<std::string> availableRigs();
 
+    // Connect via direct hamlib (serial/USB).
     bool connect(const RigConfig& cfg);
+
+    // Connect via a running rigctld daemon (hamlib NET rigctl backend).
+    // host:port defaults to localhost:4532.
+    bool connectRigctld(const std::string& host, int port);
+
     void disconnect();
     bool isConnected() const { return m_connected; }
 

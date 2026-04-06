@@ -145,8 +145,11 @@ void Settings::load()
     rigHandshake = getInt  (m, "rigHandshake",  rigHandshake);
     rigDtrState  = getInt  (m, "rigDtrState",   rigDtrState);
     rigRtsState  = getInt  (m, "rigRtsState",   rigRtsState);
-    rigEnabled   = getBool (m, "rigEnabled",    rigEnabled);
-    freqKhz      = getLLong(m, "freqKhz",       freqKhz);
+    rigEnabled      = getBool (m, "rigEnabled",      rigEnabled);
+    rigctldEnabled  = getBool (m, "rigctldEnabled",  rigctldEnabled);
+    rigctldHost     = getStr  (m, "rigctldHost",     rigctldHost);
+    rigctldPort     = getInt  (m, "rigctldPort",     rigctldPort);
+    freqKhz         = getLLong(m, "freqKhz",         freqKhz);
     rigMode      = getStr  (m, "rigMode",       rigMode);
     audioDevice  = getStr  (m, "audioDevice",   audioDevice);
     setSystemClock = getBool(m, "setSystemClock", setSystemClock);
@@ -171,8 +174,11 @@ void Settings::save() const
     if (!f) return;
     auto b = [](bool v) -> const char* { return v ? "true" : "false"; };
     f << "{\n";
-    f << "    \"rigEnabled\":      " << b(rigEnabled)      << ",\n";
-    f << "    \"rigModel\":        " << rigModel           << ",\n";
+    f << "    \"rigEnabled\":       " << b(rigEnabled)       << ",\n";
+    f << "    \"rigctldEnabled\":   " << b(rigctldEnabled)   << ",\n";
+    f << "    \"rigctldHost\":      \"" << escapeStr(rigctldHost) << "\",\n";
+    f << "    \"rigctldPort\":      " << rigctldPort         << ",\n";
+    f << "    \"rigModel\":         " << rigModel            << ",\n";
     f << "    \"rigPort\":         \"" << escapeStr(rigPort) << "\",\n";
     f << "    \"rigBaud\":         " << rigBaud            << ",\n";
     f << "    \"rigDataBits\":     " << rigDataBits        << ",\n";

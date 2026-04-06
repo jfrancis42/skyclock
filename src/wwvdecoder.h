@@ -85,6 +85,11 @@ public:
     using BitCallback = std::function<void(int type, int ms)>;
     void setBitCallback(BitCallback cb) { m_bitCb = std::move(cb); }
 
+    // When enabled (default: true), decoded frames are rejected unless the
+    // decoded UTC time is within 25 hours of the system clock.  Disable for
+    // file-based debugging where the recording may be from a different date.
+    void setTimePlausibilityCheck(bool enable) { m_timePlausibility = enable; }
+
 private:
     // --- Goertzel tone power at freqHz over a block of n samples ---
     static float goertzel(const float* buf, int n, float freqHz, float sampleRate);
@@ -130,7 +135,7 @@ private:
     // background level and is used to reject false 1 kHz tick detections that
     // are actually caused by 100 Hz MARKER harmonics: genuine ticks have p100
     // near background; false triggers from harmonics have p100 >> background.
-    float m_background100 = 1e-5f; // slow EMA of 100 Hz noise floor
+    float m_background100 = 1e-3f; // slow EMA of 100 Hz noise floor
 
     // --- Energy integration: per-second 100 Hz power accumulators ----------
     // Three fixed sub-windows after each tick, filled with raw Goertzel power:
@@ -153,6 +158,15 @@ private:
     static constexpr int BIT_MARKER = 2;
     static constexpr int BIT_MISSING = 3;  // gap-fill placeholder for lost seconds
 
+    // --- free-running prediction and consistency ---
+    // Prediction fires at bat=k_predDelay rather than bat=100, giving real ticks
+    // at bat=100..105 a chance to fire before the fallback kicks in.
+    static constexpr int k_predDelay = 106;
+    // Require this many temporally-consistent consecutive frames before emitting
+    // a result via m_frameCb.  One stray match passes BCD range checks by chance;
+    // two frames 60 s apart cannot.
+    static constexpr int k_minConsecutiveGood = 2;
+
     int   m_bits[k_bufSize];
     std::chrono::steady_clock::time_point m_bitTimes[k_bufSize]; // tick timestamps
     int   m_bitHead  = 0;   // write index (mod k_bufSize)
@@ -163,6 +177,12 @@ private:
     std::chrono::steady_clock::time_point m_audioEpoch; // audio time at block 0
     std::chrono::steady_clock::time_point m_p0Time;     // audio time at decoded P0 tick
     bool  m_p0Valid  = false;
+
+    // --- temporal consistency state ---
+    std::chrono::steady_clock::time_point m_prevP0Time;  // P0 timestamp of previous decoded frame
+    int   m_consecutiveGood = 0; // consecutive frames that passed all checks + timing
+
+    bool  m_timePlausibility = true; // reject frames >25 h from system clock
 
     FrameCallback m_frameCb;
     BitCallback   m_bitCb;
