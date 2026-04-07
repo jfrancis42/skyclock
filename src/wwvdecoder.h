@@ -288,19 +288,14 @@ private:
     BitCallback   m_bitCb;
     TickCallback  m_tickCb;
 
-    // --- I/Q envelope demodulation (setIqOffset) ----------------------------
-    // Rotates a complex phasor at m_iqOffset Hz, mixes input, two-stage IIR
-    // low-pass filters the I and Q channels, then feeds sqrt(I²+Q²) to the
-    // existing block processor.  Disabled when m_iqOffset == 0.
-    float m_iqOffset    = 0.0f;
-    float m_iqCosStep   = 1.0f;  // cos of phase increment per sample
-    float m_iqSinStep   = 0.0f;  // sin of phase increment per sample
-    float m_iqCosState  = 1.0f;  // current phasor real part (unit circle)
-    float m_iqSinState  = 0.0f;  // current phasor imaginary part
-    float m_iLpf1       = 0.0f;  // I channel first IIR stage state
-    float m_iLpf2       = 0.0f;  // I channel second IIR stage state
-    float m_qLpf1       = 0.0f;  // Q channel first IIR stage state
-    float m_qLpf2       = 0.0f;  // Q channel second IIR stage state
-    std::vector<float> m_iqEnvBuf; // scratch buffer for envelope samples
-    int   m_iqRenorm    = 0;       // counter for phasor renormalisation
+    // --- IQ offset mode (setIqOffset) ----------------------------------------
+    // When m_iqOffset > 0, the Goertzel detectors are shifted to look at
+    // (offset + 1000 Hz) for ticks and (offset + 100 Hz) for the subcarrier,
+    // matching a USB radio tuned offset Hz below the WWV carrier frequency.
+    // No baseband mixing is performed — the previous IQ conversion approach
+    // produced a constant (2×offset)-Hz tone from the AM carrier that prevented
+    // rising-edge tick detection.
+    float m_iqOffset  = 0.0f;
+    float m_tickFreq  = 1000.0f;  // Goertzel frequency for 1 kHz tick
+    float m_subFreq   =  100.0f;  // Goertzel frequency for 100 Hz subcarrier
 };
