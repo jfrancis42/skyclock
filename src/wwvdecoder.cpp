@@ -73,10 +73,23 @@ static const int k_zeroSecs[] = {4, 10, 11, 14, 20, 21, 24, 34, 35, 36, 37, 44, 
 // Minimum total-window SNR to produce any bit; below this → MISSING.
 // noise_800 = m_noiseFloor100 × (80 blocks / 6 blocks).
 static constexpr float k_snrMin      = 2.0f;
-// Fraction of total energy in the late or mid sub-window that divides the
-// three bit types.  Derived from Python energy analysis on wwv-noisy.opus.
-static constexpr float k_lateFrac    = 0.28f; // late_frac > this → MARKER
-static constexpr float k_midFrac     = 0.33f; // mid_frac  > this → ONE
+// Fraction of noise-subtracted energy in the late or mid sub-window that
+// divides the three bit types.  These thresholds apply to noise-subtracted
+// fractions (E_late_s / E_total_s) rather than raw fractions.
+//
+// For noise-subtracted fractions, a pure tone gives the same fractions as
+// the raw case (signal dominates), but purely-noise bits produce E_total_s ≈ 0
+// which triggers the E_total_s guard rather than a false-MARKER classification.
+//
+// True MARKER:  late_frac_s = 30/(20+30+30) = 0.375  → must be > k_lateFrac
+// True ONE:     mid_frac_s  = 30/(20+30)    = 0.600  → must be > k_midFrac
+// True ZERO:    late_frac_s ≈ 0, mid_frac_s ≈ 0      → neither threshold met
+//
+// HF sky-wave delay can put ZERO/ONE energy in the late window, yielding
+// late_frac_s ≈ 0.1–0.25.  k_lateFrac = 0.28 keeps a comfortable margin
+// below the true-MARKER value (0.375) while tolerating this multipath.
+static constexpr float k_lateFrac    = 0.28f; // late_frac_s > this → MARKER
+static constexpr float k_midFrac     = 0.33f; // mid_frac_s  > this → ONE
 
 /* ── Constructor ─────────────────────────────────────────────────────────── */
 WwvDecoder::WwvDecoder(float sampleRate)
@@ -108,9 +121,109 @@ float WwvDecoder::goertzel(const float* buf, int n, float freqHz, float sampleRa
     return power / ((float)n * (float)n); // normalise to per-sample²
 }
 
+/* ── Complex Goertzel: returns {I, Q} components ────────────────────────── */
+WwvDecoder::IQ WwvDecoder::goertzelComplex(const float* buf, int n,
+                                           float freqHz, float sampleRate)
+{
+    float k     = freqHz / sampleRate * (float)n;
+    float omega = 2.0f * (float)M_PI * k / (float)n;
+    float coeff = 2.0f * cosf(omega);
+    float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        q2 = q1; q1 = q0;
+        q0 = coeff * q1 - q2 + buf[i];
+    }
+    // I = real part, Q = imaginary part of the DFT bin.
+    float I = (q1 * cosf(omega) - q2) / (float)n;
+    float Q = (q1 * sinf(omega))       / (float)n;
+    return {I, Q};
+}
+
+/* ── setIqOffset ─────────────────────────────────────────────────────────── */
+void WwvDecoder::setIqOffset(float offsetHz)
+{
+    m_iqOffset   = offsetHz;
+    float phase  = 2.0f * (float)M_PI * offsetHz / m_sampleRate;
+    m_iqCosStep  = cosf(phase);
+    m_iqSinStep  = sinf(phase);
+    m_iqCosState = 1.0f;
+    m_iqSinState = 0.0f;
+    m_iLpf1 = m_iLpf2 = m_qLpf1 = m_qLpf2 = 0.0f;
+    m_iqRenorm = 0;
+}
+
 /* ── pushSamples ─────────────────────────────────────────────────────────── */
 void WwvDecoder::pushSamples(const float* samples, int count)
 {
+    if (m_iqOffset > 0.0f) {
+        // ── I/Q envelope demodulation ─────────────────────────────────────
+        // Mix input with complex oscillator at m_iqOffset Hz, low-pass filter
+        // I and Q, then feed the envelope sqrt(I²+Q²) to the block processor.
+        //
+        // LPF: two cascaded single-pole IIRs, each with cutoff 1100 Hz.
+        // This gives ~7 dB additional rejection at 1500 Hz (the image of the
+        // 1 kHz tick shifted up by the offset) relative to a single stage.
+        //
+        //   α = 1 − exp(−2π × 1100 / sampleRate)
+        //
+        // The envelope contains:
+        //   • DC         — from the carrier (Goertzel ignores DC)
+        //   • 100 Hz     — from the BCD subcarrier at (offset+100) Hz in audio
+        //   • 1000 Hz    — from the 1 kHz tick at (offset+1000) Hz in audio
+        // Both match what the existing Goertzel detectors expect.
+        const float alpha = 1.0f - expf(-2.0f * (float)M_PI * 1100.0f / m_sampleRate);
+        const float beta  = 1.0f - alpha;
+
+        if ((int)m_iqEnvBuf.size() < count)
+            m_iqEnvBuf.resize(count);
+
+        for (int i = 0; i < count; ++i) {
+            // Advance complex phasor by one step (cos/sin rotation).
+            float nc = m_iqCosState * m_iqCosStep - m_iqSinState * m_iqSinStep;
+            float ns = m_iqCosState * m_iqSinStep + m_iqSinState * m_iqCosStep;
+            m_iqCosState = nc;
+            m_iqSinState = ns;
+
+            // Renormalise every 4096 samples to prevent rounding drift.
+            if (++m_iqRenorm >= 4096) {
+                m_iqRenorm = 0;
+                float mag = sqrtf(nc * nc + ns * ns);
+                if (mag > 1e-10f) {
+                    m_iqCosState /= mag;
+                    m_iqSinState /= mag;
+                }
+            }
+
+            // Mix
+            float x    = samples[i];
+            float iSig = x * m_iqCosState;
+            float qSig = x * m_iqSinState;
+
+            // Two-stage IIR LPF
+            m_iLpf1 = beta * m_iLpf1 + alpha * iSig;
+            m_iLpf2 = beta * m_iLpf2 + alpha * m_iLpf1;
+            m_qLpf1 = beta * m_qLpf1 + alpha * qSig;
+            m_qLpf2 = beta * m_qLpf2 + alpha * m_qLpf1;
+
+            // Use the I (in-phase) channel directly — NOT sqrt(I²+Q²).
+            // sqrt(I²+Q²) computes the amplitude envelope.  For a single tone
+            // at frequency f shifted to baseband, the envelope is constant DC;
+            // the Goertzel at f would see zero.  The I channel alone gives
+            // a×cos(2πft), which the Goertzel detects with normal power a²/4.
+            m_iqEnvBuf[i] = m_iLpf2;
+        }
+
+        // Feed envelope samples into the existing block processor.
+        for (int s = 0; s < count; ++s) {
+            m_blockBuf[m_blockBufFill++] = m_iqEnvBuf[s];
+            if (m_blockBufFill == m_blockSize) {
+                processBlock(m_blockBuf.data());
+                m_blockBufFill = 0;
+            }
+        }
+        return;
+    }
+
     for (int s = 0; s < count; ++s) {
         m_blockBuf[m_blockBufFill++] = samples[s];
         if (m_blockBufFill == m_blockSize) {
@@ -150,6 +263,15 @@ void WwvDecoder::processBlock(const float* block)
     m_signalLevel = (snr1k > 1.0f) ? (1.0f - 1.0f / snr1k) : 0.0f;
     if (m_signalLevel > 1.0f) m_signalLevel = 1.0f;
 
+    // ── Comb filter update (refclock_wwv.c 1.1) ─────────────────────────────
+    // Update the comb slot for the current 10 ms epoch within the second.
+    // After many seconds the comb peak converges to the true tick position.
+    {
+        int slot = (m_totalBlocks - 1) % 100;
+        m_combBuf[slot] = 0.9f * m_combBuf[slot] + 0.1f * p1k;
+        m_combSlot = (slot + 1) % 100;
+    }
+
     // ── 100 Hz Goertzel — raw power for accumulation ─────────────────────────
     float p100 = goertzel(block, m_blockSize, 100.0f, m_sampleRate);
 
@@ -177,10 +299,17 @@ void WwvDecoder::processBlock(const float* block)
     // near the background floor.  MARKER harmonics (10th harmonic of 100 Hz)
     // produce elevated p1k AND elevated p100 simultaneously.  Gate on p100 to
     // reject these false triggers.
-    bool tickNow = (p1k > m_noisePower * 100.0f)
+    //
+    // Threshold: 15× noise floor.  Live HF measurements on a clean IC-7300
+    // signal into a USB audio device show tick SNR of 18–61× (vs. 100× in the
+    // original recordings used for development).  100× was too aggressive for
+    // real-world AM and SSB reception; 15× retains the anti-spoof gate as the
+    // primary false-trigger rejection mechanism.
+    bool tickNow = (p1k > m_noisePower * 15.0f)
                 && (p100 < m_background100 * 10.0f);
     if (static_cast<int>(m_totalBlocks) - m_lastTickBlock < 95) tickNow = false;
-    if (tickNow && !m_tickLastBlock) {
+    bool risingEdge = (tickNow && !m_tickLastBlock);
+    if (risingEdge) {
         // Rising edge: reset raw sample buffers for the new second.
         m_earlyFill = m_midFill = m_lateFill = m_noiseFill = 0;
         m_lastTickBlock = m_totalBlocks;
@@ -189,23 +318,82 @@ void WwvDecoder::processBlock(const float* block)
     }
     m_tickLastBlock = tickNow;
 
-    // ── Free-running 1-second prediction (primary fallback) ──────────────────
-    // Once a real tick has been detected, advance the second boundary by
-    // exactly 100 blocks (1000 ms) when no real tick fires.  WWV's cesium
-    // clock makes the actual second boundaries accurate to microseconds, so
-    // the predicted position is correct to within audio-clock jitter (~1 ms
-    // per minute for a typical consumer sound card at 50 ppm).
-    //
-    // This replaces SYNTHK for steady-state operation: SYNTHK fires on 100 Hz
-    // onset, which arrives late under flutter fading, shifting the accumulation
-    // windows away from the true second boundary.  The prediction uses the last
-    // confirmed tick as a phase anchor and drifts only with the audio clock.
+    // ── Free-running 1-second prediction with comb+median correction (1.1/1.2) ─
+    // On each rising edge, update the comb argmax → 3-sample median to estimate
+    // the stable tick epoch offset within the second.  The prediction fires at
+    // that offset rather than the fixed k_predDelay, adapting to audio-clock
+    // drift and HF propagation delay.
+    if (risingEdge) {
+        // Find the comb slot with peak accumulated 1 kHz power.
+        int peakSlot = 0;
+        float peakVal = -1.0f;
+        for (int i = 0; i < 100; ++i) {
+            if (m_combBuf[i] > peakVal) { peakVal = m_combBuf[i]; peakSlot = i; }
+        }
+        // rawOffset = how many blocks from the last anchor to the next expected tick.
+        // In steady state this ≈ 100.  Clamp to [95 .. k_predDelay=106].
+        //
+        // The comb peakSlot is the 10 ms epoch (0–99) where 1 kHz energy is
+        // highest.  We just fired a risingEdge at the current epoch
+        //   currentSlot = (m_totalBlocks - 1) % 100.
+        // The next occurrence of peakSlot is (peakSlot - currentSlot + 100) % 100
+        // blocks away; if that is 0 (we are exactly AT the peak) the tick just
+        // fired so the next occurrence is a full 100 blocks away.  Add 6 blocks
+        // of margin so real ticks at bat ≈ 100 have time to arrive before the
+        // prediction fires.  The anchor-correction in the prediction branch then
+        // backs the anchor up by (predTarget−100) so sub-windows stay aligned.
+        {
+            int currentSlot = (int)((m_totalBlocks - 1) % 100);
+            int rawOffset = ((peakSlot - currentSlot) % 100 + 100) % 100;
+            if (rawOffset == 0) rawOffset = 100;
+            rawOffset += 6;  // fire prediction 60 ms after expected tick
+            // Lower clamp is 100, not 95: allowing predTarget < 100 causes the
+            // prediction to fire BEFORE the expected real tick (at bat < 100).
+            // The real tick then arrives at bat = 100 - (100 - predTarget) < 95
+            // and is blocked by the lockout forever.  With clamp [100, 106],
+            // real ticks always arrive at bat=100 from the corrected anchor.
+            if (rawOffset < 100)         rawOffset = 100;
+            if (rawOffset > k_predDelay) rawOffset = k_predDelay;
+
+            m_epochHist[m_epochHistIdx] = rawOffset;
+            m_epochHistIdx = (m_epochHistIdx + 1) % 3;
+
+            // 3-sample median (sort copy).
+            int h[3] = {m_epochHist[0], m_epochHist[1], m_epochHist[2]};
+            if (h[0] > h[1]) { int t = h[0]; h[0] = h[1]; h[1] = t; }
+            if (h[1] > h[2]) { int t = h[1]; h[1] = h[2]; h[2] = t; }
+            if (h[0] > h[1]) { int t = h[0]; h[0] = h[1]; h[1] = t; }
+            m_combPeakMedian = h[1];
+        }
+    }
+
     int bat_predict = m_totalBlocks - m_lastTickBlock;
-    if (m_lastTickBlock > 0 && bat_predict == k_predDelay && !tickNow) {
-        // Real tick didn't arrive — advance prediction.
+    int predTarget  = (m_combPeakMedian > 0) ? m_combPeakMedian : k_predDelay;
+    if (m_lastTickBlock > 0 && bat_predict == predTarget && !tickNow) {
+        // Real tick didn't arrive — fire the free-running prediction.
+        //
+        // ANCHOR CORRECTION: set the anchor to where the tick *should* have
+        // been (bat=100 from the previous anchor, i.e. predTarget−100 blocks
+        // before now) rather than to the current block.  This keeps the early/
+        // mid/late sub-windows aligned with the actual second boundary.
+        //
+        // Without this, each missed prediction shifts the anchor forward by
+        // (predTarget−100)=6 blocks, causing the late sub-window to drift into
+        // the NEXT second's subcarrier onset (~9 predictions later), producing
+        // a cascade of false MARKER classifications.
+        //
+        // With the correction the next real tick arrives at bat=100 from the
+        // corrected anchor (≥ the 95-block lockout), so it resyncs immediately
+        // when the signal recovers rather than staying blocked for 17 seconds.
+        //
+        // Guard: only correct when predTarget > 100 (the common case); if
+        // predTarget ≤ 100 the prediction is already firing at or before the
+        // expected tick and no forward shift has occurred.
+        int correction = (predTarget > 100) ? (predTarget - 100) : 0;
         m_earlyFill = m_midFill = m_lateFill = m_noiseFill = 0;
-        m_lastTickBlock = m_totalBlocks;
-        m_lastTickTime  = blockTime;
+        m_lastTickBlock = m_totalBlocks - correction;
+        m_lastTickTime  = blockTime - std::chrono::milliseconds(
+            static_cast<long long>(correction) * 10LL);
     }
 
     // Note: SYNTHK (100 Hz onset detection for initial lock) is intentionally
@@ -290,17 +478,59 @@ void WwvDecoder::onWindowClose(std::chrono::steady_clock::time_point tickTime)
     float E_late  = e_late_g  * (float)m_lateFill;
     float E_total = E_early + E_mid + E_late;
 
+    // ── Q-channel coherence (refclock_wwv.c 1.3) ─────────────────────────────
+    // Compute the complex Goertzel over the early window.  The I component is
+    // the in-phase projection; Q is 90° ahead.  The ratio |I|/magnitude gives
+    // the coherence of the subcarrier: 1.0 for a pure steady tone, ~0 for
+    // incoherent flutter fragments.
+    //
+    // Coherence is tracked via a phase EMA (Doppler tracking) but is NOT applied
+    // to the MISSING threshold — doing so would unfairly penalise marginal but
+    // real signals on weak HF paths.  The coherence value is available for
+    // future use (e.g. per-bit confidence scoring for the BCD accumulator).
+    if (m_earlyFill > 0) {
+        IQ iq = goertzelComplex(m_earlyRaw.data(), m_earlyFill, 100.0f, m_sampleRate);
+        float mag = sqrtf(iq.I * iq.I + iq.Q * iq.Q);
+        // Update subcarrier phase EMA (slow — tracks ionospheric Doppler drift).
+        const float kPhaseAlpha = 0.05f;
+        m_subcarrierPhaseEma = (1.0f - kPhaseAlpha) * m_subcarrierPhaseEma
+                             + kPhaseAlpha * ((mag > 1e-10f) ? iq.Q : 0.0f);
+    }
+
     // Noise reference: m_noiseFloor100 is the EMA of E_noise ≈ σ².
     // Each of the three sub-windows contributes ~σ² noise, so total noise ≈ 3σ².
     float noise_ref = m_noiseFloor100 * 3.0f;
     float snr_total = (noise_ref > 1e-15f) ? (E_total / noise_ref) : 0.0f;
 
+    // ── Noise-subtracted energy fractions ────────────────────────────────────
+    // Raw fractions (E_late/E_total) are biased toward MARKER for pure noise
+    // because the late and mid windows are 30 blocks each vs. 20 for early.
+    // For equal broadband noise: late/total = 30/80 = 0.375 > k_lateFrac=0.28,
+    // which would misclassify pure-noise bits as MARKER.  To safely lower the
+    // MISSING threshold we subtract the expected per-window noise floor (σ²)
+    // from each window before computing fractions.  For pure noise each window
+    // measures ≈ σ²; after subtraction all are ≈ 0, so fractions are undefined
+    // and the E_total_s guard forces MISSING.  For a real signal the window
+    // containing the subcarrier has E >> σ², giving unbiased fractions.
+    float N = m_noiseFloor100;  // expected noise energy per window ≈ σ²
+    float E_early_s = (E_early > N) ? E_early - N : 0.0f;
+    float E_mid_s   = (E_mid   > N) ? E_mid   - N : 0.0f;
+    float E_late_s  = (E_late  > N) ? E_late  - N : 0.0f;
+    float E_total_s = E_early_s + E_mid_s + E_late_s;
+
+    // Hard MISSING: below k_snrSoft (1.5), or no window significantly above
+    // the noise floor (guards against pure-noise fluctuations at borderline SNR).
+    // At k_snrSoft=1.5 vs. the old k_snrMin=2.0, borderline bits from a
+    // flutter-faded HF path get a second chance via the noise-subtracted fractions.
+    static constexpr float k_snrSoft = 1.5f;
+
+    float late_frac = 0.0f, mid_frac = 0.0f;
     int type;
-    if (snr_total < k_snrMin) {
+    if (snr_total < k_snrSoft || E_total_s < N * 0.2f) {
         type = BIT_MISSING;
     } else {
-        float late_frac = (E_total > 0.0f) ? E_late / E_total : 0.0f;
-        float mid_frac  = (E_total > 0.0f) ? E_mid  / E_total : 0.0f;
+        late_frac = (E_total_s > 0.0f) ? E_late_s / E_total_s : 0.0f;
+        mid_frac  = (E_total_s > 0.0f) ? E_mid_s  / E_total_s : 0.0f;
 
         if      (late_frac > k_lateFrac) type = BIT_MARKER;
         else if (mid_frac  > k_midFrac)  type = BIT_ONE;
@@ -386,11 +616,35 @@ bool WwvDecoder::decodeFrame(int startOffset)
         return (bit(pos) == BIT_ONE) ? 1 : 0;
     };
 
+    // ── BCD digit accumulator helper (refclock_wwv.c 1.4) ────────────────────
+    // fieldIdx: 0=min-tens,1=min-units,2=hr-tens,3=hr-units,
+    //           4=day-hund,5=day-tens,6=day-units,7=yr-tens,8=yr-units
+    // Decay all entries, then boost the decoded value.
+    // Updates m_digitFields[fieldIdx] and returns the new winning value (-1 if
+    // not yet converged to kBcdMinStreak consecutive frames).
+    auto updateDigit = [&](int fieldIdx, int decodedVal) {
+        DigitField& df = m_digitFields[fieldIdx];
+        for (int v = 0; v < 10; ++v)
+            df.like[v] *= (1.0f - kBcdAlpha);
+        if (decodedVal >= 0 && decodedVal <= 9)
+            df.like[decodedVal] += kBcdAlpha;
+        // Find winner.
+        int winner = 0;
+        for (int v = 1; v < 10; ++v)
+            if (df.like[v] > df.like[winner]) winner = v;
+        if (winner == df.value) {
+            ++df.streak;
+        } else {
+            df.value  = winner;
+            df.streak = 1;
+        }
+    };
+
     // Reject frames with too many missing bits — BCD decode becomes unreliable.
     int missingCount = 0;
     for (int i = 0; i < 60; ++i)
         if (bit(i) == BIT_MISSING) ++missingCount;
-    if (missingCount > 30) return false;
+    if (missingCount > 40) return false;
 
     // 1. Verify markers at expected positions.
     // Under HF flutter fading, position markers (P1–P5) sometimes appear one
@@ -431,18 +685,25 @@ bool WwvDecoder::decodeFrame(int startOffset)
     int units = bval(5)*8  + bval(6)*4  + bval(7)*2  + bval(8)*1;
     int minute = tens + units;
     if (minute < 0 || minute > 59) return false;
+    updateDigit(0, tens / 10);
+    updateDigit(1, units);
 
     // ── Decode hours ───────────────────────────────────────────────────────
     int htens  = bval(12)*20 + bval(13)*10;
     int hunits = bval(15)*8  + bval(16)*4  + bval(17)*2 + bval(18)*1;
     int hour   = htens + hunits;
     if (hour < 0 || hour > 23) return false;
+    updateDigit(2, htens / 10);
+    updateDigit(3, hunits);
 
     // ── Decode day of year ─────────────────────────────────────────────────
     int doy = bval(22)*200 + bval(23)*100
             + bval(25)*80  + bval(26)*40 + bval(27)*20 + bval(28)*10
             + bval(30)*8   + bval(31)*4  + bval(32)*2  + bval(33)*1;
     if (doy < 1 || doy > 366) return false;
+    updateDigit(4, (doy / 100));
+    updateDigit(5, (doy % 100) / 10);
+    updateDigit(6, doy % 10);
 
     // ── Decode year (last 2 digits) ────────────────────────────────────────
     int ytens  = bval(45)*8 + bval(46)*4 + bval(47)*2 + bval(48)*1;
@@ -450,6 +711,8 @@ bool WwvDecoder::decodeFrame(int startOffset)
     // Reject invalid BCD digits individually (each must be 0–9).
     if (ytens > 9 || yunits > 9) return false;
     int year2  = ytens * 10 + yunits;
+    updateDigit(7, ytens);
+    updateDigit(8, yunits);
 
     // ── Time plausibility gate ─────────────────────────────────────────────
     // Reject frames whose decoded UTC is more than 25 hours from the system
@@ -616,4 +879,13 @@ void WwvDecoder::setAudioLatency(double latencySeconds)
 WwvTime WwvDecoder::lastFrame() const
 {
     return m_frame;
+}
+
+/* ── digitFieldsConverged ────────────────────────────────────────────────── */
+int WwvDecoder::digitFieldsConverged() const
+{
+    int count = 0;
+    for (int i = 0; i < 9; ++i)
+        if (m_digitFields[i].streak >= kBcdMinStreak) ++count;
+    return count;
 }

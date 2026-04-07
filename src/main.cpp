@@ -95,7 +95,7 @@ static char  g_bitRow[61];     // display chars (0, 1, |, ?) + NUL; space-padded
 static int   g_bitPos = 0;     // total bits appended (for count label)
 static float g_smoothSig = 0.0f; // slow EMA of signal level (~3 s time constant)
 
-static constexpr int kDisplayLines = 3;
+static constexpr int kDisplayLines = 4;
 
 // Append one classified bit to the sliding display window.
 static void appendBitDisplay(int type)
@@ -127,7 +127,7 @@ static void printBar(float sig, float snrDb)
     printf("\033[0m");
 }
 
-// Redraw (or initially draw) the 3-line status panel.
+// Redraw (or initially draw) the 4-line status panel.
 // Uses \033[NA to move the cursor up and overwrite previous content.
 // Each line ends with \033[K to clear any leftover chars from a longer previous value.
 static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
@@ -144,7 +144,8 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
 
     // Line 2 — bit stream (searching) or decoded UTC time
     if (utc == 0) {
-        printf("\033[33m[%s]\033[0m  %d bit%s\033[K\n",
+        // Show the last 60 bits and total count.
+        printf("\033[2m[%s]\033[0m  %d bit%s received\033[K\n",
                g_bitRow, g_bitPos, g_bitPos == 1 ? "" : "s");
     } else {
         struct tm t;
@@ -157,25 +158,56 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
         // Confirmed: bold white.  Candidate: dim yellow to signal uncertainty.
         const char* timeColor = confirmed ? "\033[1m" : "\033[33m";
         printf("%s%04d-%02d-%02d %02d:%02d:%02d UTC\033[0m"
-               "  Day %03d  UT1%+.1fs  [conf:%d]\033[K\n",
+               "  Day %03d  UT1%+.1fs\033[K\n",
                timeColor,
                t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                t.tm_hour, t.tm_min, t.tm_sec,
-               f.dayOfYear, f.ut1Seconds, f.confidence);
+               f.dayOfYear, f.ut1Seconds);
     }
 
-    // Line 3 — status
+    // Line 3 — phase / lock status
     if (utc == 0) {
-        printf("\033[33mSearching for WWV signal...\033[0m\033[K\n");
+        int bits = g_decoder ? g_decoder->bitsReceived() : 0;
+        if (bits == 0) {
+            printf("\033[33mWaiting for signal — no ticks detected yet\033[0m\033[K\n");
+        } else if (bits < 60) {
+            printf("\033[33mReceiving bits (%d/60 for first frame attempt)\033[0m\033[K\n",
+                   bits);
+        } else {
+            printf("\033[33mDecoding — frame sync not yet achieved\033[0m\033[K\n");
+        }
     } else if (clockSet) {
         printf("\033[1m\033[32mLOCKED\033[0m  — clock set successfully\033[K\n");
     } else if (f.confidence >= minConf) {
         printf("\033[1m\033[32mLOCKED\033[0m"
-               "  [conf: %d / %d needed]\033[K\n", f.confidence, minConf);
+               "  — %d consecutive frames confirmed\033[K\n", f.confidence);
     } else {
-        printf("\033[33mCandidate\033[0m"
-               "  — unconfirmed  [conf: %d / %d needed]\033[K\n",
+        printf("\033[33mCandidate frame\033[0m"
+               "  — confirming (%d/%d frames needed)\033[K\n",
                f.confidence, minConf);
+    }
+
+    // Line 4 — decoder detail: digit convergence + DST/leap
+    int converged = g_decoder ? g_decoder->digitFieldsConverged() : 0;
+    if (utc == 0) {
+        // Show field convergence progress during initial lock acquisition.
+        printf("Fields: ");
+        for (int i = 0; i < 9; ++i) {
+            // We can't easily get per-field state here, so show a simple bar.
+            if (i < converged) printf("\033[32m■\033[0m");
+            else               printf("\033[2m□\033[0m");
+        }
+        printf("  (%d/9 digit%s stable)\033[K\n",
+               converged, converged == 1 ? "" : "s");
+    } else {
+        // After lock: show DST, leap-second warning, digit convergence.
+        const char* dstStr = (f.dstCode == 0) ? "Standard time"
+                           : (f.dstCode == 3) ? "DST in effect"
+                           : (f.dstCode == 2) ? "DST begins today"
+                           :                    "DST ends today";
+        const char* lswStr = f.leapSecondWarning ? "  \033[33m⚠ Leap second\033[0m" : "";
+        printf("%s%s  Fields: %d/9 stable  [conf:%d]\033[K\n",
+               dstStr, lswStr, converged, f.confidence);
     }
 
     fflush(stdout);
@@ -341,6 +373,11 @@ static void printHelp(const char* argv0)
     printf("                         Omit seconds to use the system clock's second.\n");
     printf("  --full-decode          Full BCD time-code decode mode (requires a clean,\n");
     printf("                         low-noise signal and two consecutive clean minutes)\n");
+    printf("  --iq-offset <hz>       I/Q envelope demodulation offset in Hz (default: 0).\n");
+    printf("                         Use with a radio tuned <hz> below WWV in USB mode.\n");
+    printf("                         Shifts the 100 Hz subcarrier and 1 kHz tick up by\n");
+    printf("                         <hz> into the radio's audio passband, then recovers\n");
+    printf("                         them via I/Q demodulation. Typical: --iq-offset 500\n");
     printf("  --rigctld              Connect to rigctld to tune the radio\n");
     printf("  --rigctld-host <host>  rigctld hostname or IP  (default: localhost)\n");
     printf("  --rigctld-port <port>  rigctld TCP port         (default: 4532)\n");
@@ -380,6 +417,7 @@ int main(int argc, char* argv[])
     std::string rigctldHostArg;           // --rigctld-host <h>
     int         rigctldPortArg  = 0;      // --rigctld-port <p>
     long long   freqKhzArg      = 0;      // --freq-khz <f>  (0 = use settings)
+    float       iqOffsetHz      = 0.0f;   // --iq-offset <hz> (0 = disabled)
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -408,6 +446,8 @@ int main(int argc, char* argv[])
             rigctldPortArg = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--freq-khz") && i + 1 < argc) {
             freqKhzArg = atoll(argv[++i]);
+        } else if (!strcmp(argv[i], "--iq-offset") && i + 1 < argc) {
+            iqOffsetHz = (float)atof(argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -462,6 +502,11 @@ int main(int argc, char* argv[])
         // decodes are visible (useful for signal analysis).
         decoder.setTimePlausibilityCheck(false);
         decoder.setMinConsecutiveFrames(1);
+        if (iqOffsetHz > 0.0f) {
+            decoder.setIqOffset(iqOffsetHz);
+            printf("I/Q offset: %.0f Hz (SSB carrier at %.0f Hz in audio)\n",
+                   iqOffsetHz, iqOffsetHz);
+        }
 
         decoder.setFrameCallback([&](const WwvTime& frame) {
             std::lock_guard<std::mutex> lk(g_frameMutex);
@@ -554,6 +599,11 @@ int main(int argc, char* argv[])
         // Lower consecutive-frame requirement to 1 for single-frame visibility.
         decoder.setTimePlausibilityCheck(false);
         decoder.setMinConsecutiveFrames(1);
+        if (iqOffsetHz > 0.0f) {
+            decoder.setIqOffset(iqOffsetHz);
+            printf("I/Q offset: %.0f Hz (SSB carrier at %.0f Hz in audio)\n",
+                   iqOffsetHz, iqOffsetHz);
+        }
 
         decoder.setFrameCallback([&](const WwvTime& frame) {
             std::lock_guard<std::mutex> lk(g_frameMutex);
@@ -624,8 +674,19 @@ int main(int argc, char* argv[])
     }
 
     // ── Live mode (PortAudio) ──────────────────────────────────────────────
+    // When I/Q offset mode is active, the radio must be in USB and tuned
+    // (iqOffsetHz) below the WWV centre frequency so that the carrier appears
+    // at iqOffsetHz in the audio passband.
+    long long   tuneHz  = cfg.freqKhz * 1000LL - (long long)iqOffsetHz;
+    std::string tuneMode = (iqOffsetHz > 0.0f) ? "USB" : cfg.rigMode;
+
     printf("Config: %s\n", cfg.path().c_str());
-    printf("Frequency: %lld kHz  Mode: %s\n", cfg.freqKhz, cfg.rigMode.c_str());
+    if (iqOffsetHz > 0.0f) {
+        printf("WWV centre: %lld kHz  I/Q offset: %.0f Hz  → tune to %.4f kHz %s\n",
+               cfg.freqKhz, iqOffsetHz, tuneHz / 1000.0, tuneMode.c_str());
+    } else {
+        printf("Frequency: %lld kHz  Mode: %s\n", cfg.freqKhz, cfg.rigMode.c_str());
+    }
 
     // ── Hamlib radio setup ─────────────────────────────────────────────────
     RigControl rig;
@@ -639,10 +700,10 @@ int main(int argc, char* argv[])
                cfg.rigctldHost.c_str(), cfg.rigctldPort);
         if (rig.connectRigctld(cfg.rigctldHost, cfg.rigctldPort)) {
             printf("Radio: connected to rigctld\n");
-            rig.setFreqHz(cfg.freqKhz * 1000LL);
-            rig.setMode(cfg.rigMode);
-            printf("Radio: tuned to %lld kHz %s\n",
-                   cfg.freqKhz, cfg.rigMode.c_str());
+            rig.setMode(tuneMode);
+            rig.setFreqHz(tuneHz);
+            printf("Radio: tuned to %.4f kHz %s\n",
+                   tuneHz / 1000.0, tuneMode.c_str());
         }
     } else if (cfg.rigEnabled) {
         // Connect via direct hamlib (serial/USB).
@@ -660,14 +721,14 @@ int main(int argc, char* argv[])
         if (rig.connect(rcfg)) {
             printf("Radio: connected (model %d on %s)\n",
                    cfg.rigModel, cfg.rigPort.c_str());
-            rig.setFreqHz(cfg.freqKhz * 1000LL);
-            rig.setMode(cfg.rigMode);
-            printf("Radio: tuned to %lld kHz %s\n",
-                   cfg.freqKhz, cfg.rigMode.c_str());
+            rig.setMode(tuneMode);
+            rig.setFreqHz(tuneHz);
+            printf("Radio: tuned to %.4f kHz %s\n",
+                   tuneHz / 1000.0, tuneMode.c_str());
         }
     } else {
-        printf("Radio: not configured (tune manually to %lld kHz %s)\n",
-               cfg.freqKhz, cfg.rigMode.c_str());
+        printf("Radio: not configured (tune manually to %.4f kHz %s)\n",
+               tuneHz / 1000.0, tuneMode.c_str());
     }
 
     // ── PortAudio setup ────────────────────────────────────────────────────
@@ -705,6 +766,11 @@ int main(int argc, char* argv[])
     // ── Decoder ────────────────────────────────────────────────────────────
     WwvDecoder decoder(sampleRate);
     g_decoder = &decoder;
+    if (iqOffsetHz > 0.0f) {
+        decoder.setIqOffset(iqOffsetHz);
+        printf("I/Q offset: %.0f Hz  (tune radio %.3f kHz below WWV in USB mode)\n",
+               iqOffsetHz, iqOffsetHz / 1000.0);
+    }
 
     // ── Mode-specific setup ────────────────────────────────────────────────
     if (fullDecode) {

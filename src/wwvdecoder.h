@@ -28,6 +28,22 @@ struct WwvTime {
 };
 
 /**
+ * DigitField — per-BCD-digit EMA accumulator (refclock_wwv.c technique 1.4).
+ *
+ * For each of the 9 BCD digit fields (minute-tens, minute-units, hour-tens,
+ * hour-units, day-hundreds, day-tens, day-units, year-tens, year-units),
+ * maintains a 10-element array of EMA correlation scores.  When a decoded
+ * frame assigns value v to the field, like[v] is boosted by kBcdAlpha and all
+ * others are decayed.  A field "converges" when one entry dominates and has
+ * sustained for kBcdMinStreak consecutive frames.
+ */
+struct DigitField {
+    float like[10] = {};  // EMA score per digit value 0–9
+    int   value    = -1;  // winning value, or -1 if not yet converged
+    int   streak   = 0;   // consecutive frames where same value won
+};
+
+/**
  * WwvDecoder — real-time WWV time code decoder.
  *
  * Feed mono float audio samples (normalised –1..+1).  Uses dual Goertzel
@@ -70,6 +86,11 @@ public:
     // Most recently decoded frame.
     WwvTime lastFrame() const;
 
+    // Returns the number of BCD digit fields (out of 9) that have converged
+    // to a stable value (streak >= kBcdMinStreak consecutive frames).
+    // Range 0–9; useful as a "lock quality" indicator.
+    int digitFieldsConverged() const;
+
     // Instantaneous signal level, 0–1 based on 1 kHz tick SNR.
     float signalLevel() const { return m_signalLevel; }
 
@@ -92,6 +113,18 @@ public:
     using TickCallback = std::function<void(std::chrono::steady_clock::time_point)>;
     void setTickCallback(TickCallback cb) { m_tickCb = std::move(cb); }
 
+    // Enable I/Q frequency-shift demodulation for SSB reception tuned offsetHz
+    // below the WWV carrier.  When enabled, pushSamples() mixes the input with
+    // a complex oscillator at offsetHz, low-pass filters I and Q, then feeds
+    // the I (in-phase) channel to the Goertzel detectors.  This shifts the
+    // 100 Hz subcarrier (at offsetHz+100 Hz in SSB audio) and the 1 kHz tick
+    // (at offsetHz+1000 Hz) back to their nominal baseband frequencies.
+    // Note: only the I channel is used (not sqrt(I²+Q²)).  The magnitude would
+    // give a constant envelope for a single tone (DC), defeating the Goertzel.
+    // Typical use: setIqOffset(500.0f) when radio is tuned 500 Hz low in USB.
+    // Default: 0 (disabled — direct AM audio).
+    void setIqOffset(float offsetHz);
+
     // When enabled (default: true), decoded frames are rejected unless the
     // decoded UTC time is within 25 hours of the system clock.  Disable for
     // file-based debugging where the recording may be from a different date.
@@ -105,6 +138,10 @@ public:
 private:
     // --- Goertzel tone power at freqHz over a block of n samples ---
     static float goertzel(const float* buf, int n, float freqHz, float sampleRate);
+
+    // --- Complex Goertzel: returns {I, Q} at freqHz (for Q-channel coherence) ---
+    struct IQ { float I, Q; };
+    static IQ goertzelComplex(const float* buf, int n, float freqHz, float sampleRate);
 
     // Process one complete Goertzel block (m_blockSize samples).
     void processBlock(const float* block);
@@ -149,6 +186,21 @@ private:
     // near background; false triggers from harmonics have p100 >> background.
     float m_background100 = 1e-3f; // slow EMA of 100 Hz noise floor
 
+    // --- Comb filter: 100-slot per-epoch 1 kHz EMA (refclock_wwv.c 1.1) ------
+    // Slot m_combSlot accumulates the 1 kHz Goertzel power from the block that
+    // lands on that 10 ms epoch within each second.  argmax gives the tick epoch
+    // integrated over many seconds — far more stable than rising-edge detection.
+    float m_combBuf[100] = {};     // EMA of 1 kHz power per 10 ms epoch slot
+    int   m_combSlot     = 0;      // current epoch index 0–99
+
+    // --- Median filter on comb peak (refclock_wwv.c 1.2) ---------------------
+    int   m_epochHist[3]   = {};   // ring buffer: last 3 comb-argmax positions
+    int   m_epochHistIdx   = 0;    // next write index into m_epochHist
+    int   m_combPeakMedian = 0;    // current 3-sample median (blocks after last tick)
+
+    // --- Q-channel subcarrier phase EMA (refclock_wwv.c 1.3) -----------------
+    float m_subcarrierPhaseEma = 0.0f; // slow EMA of Q_early from 100 Hz Goertzel
+
     // --- Energy integration: full-window coherent Goertzel ------------------
     // Raw audio samples for each sub-window after each tick:
     //   early : blocks  3–22  =  30–230 ms  (20 blocks = 20×blockSize samples)
@@ -185,7 +237,14 @@ private:
 
     // --- free-running prediction and consistency ---
     // Prediction fires at bat=k_predDelay rather than bat=100, giving real ticks
-    // at bat=100..105 a chance to fire before the fallback kicks in.
+    // at bat≈100 a chance to fire before the fallback kicks in.
+    //
+    // IMPORTANT — anchor correction: when a prediction fires, the anchor is set
+    // to (currentBlock − (predTarget−100)) rather than currentBlock.  This keeps
+    // the sub-windows aligned with the actual second boundary (which was expected
+    // at bat=100 but missed) rather than shifting them forward by predTarget−100
+    // blocks.  As a result the next real tick arrives at bat=100 (≥95 lockout),
+    // resyncing immediately rather than staying blocked for ~17 seconds.
     static constexpr int k_predDelay = 106;
     // Require this many temporally-consistent consecutive frames before emitting
     // a result via m_frameCb.  One stray match passes BCD range checks by chance;
@@ -210,7 +269,30 @@ private:
     bool  m_timePlausibility = true; // reject frames >25 h from system clock
     int   m_minConsecutiveGood = k_minConsecutiveGood;
 
+    // --- Per-digit BCD accumulator (refclock_wwv.c 1.4) ----------------------
+    // Fields: 0=minute-tens, 1=minute-units, 2=hour-tens, 3=hour-units,
+    //         4=day-hundreds, 5=day-tens, 6=day-units, 7=year-tens, 8=year-units
+    static constexpr float kBcdAlpha    = 0.25f; // EMA weight per frame
+    static constexpr int   kBcdMinStreak = 3;    // frames to declare convergence
+    DigitField m_digitFields[9];
+
     FrameCallback m_frameCb;
     BitCallback   m_bitCb;
     TickCallback  m_tickCb;
+
+    // --- I/Q envelope demodulation (setIqOffset) ----------------------------
+    // Rotates a complex phasor at m_iqOffset Hz, mixes input, two-stage IIR
+    // low-pass filters the I and Q channels, then feeds sqrt(I²+Q²) to the
+    // existing block processor.  Disabled when m_iqOffset == 0.
+    float m_iqOffset    = 0.0f;
+    float m_iqCosStep   = 1.0f;  // cos of phase increment per sample
+    float m_iqSinStep   = 0.0f;  // sin of phase increment per sample
+    float m_iqCosState  = 1.0f;  // current phasor real part (unit circle)
+    float m_iqSinState  = 0.0f;  // current phasor imaginary part
+    float m_iLpf1       = 0.0f;  // I channel first IIR stage state
+    float m_iLpf2       = 0.0f;  // I channel second IIR stage state
+    float m_qLpf1       = 0.0f;  // Q channel first IIR stage state
+    float m_qLpf2       = 0.0f;  // Q channel second IIR stage state
+    std::vector<float> m_iqEnvBuf; // scratch buffer for envelope samples
+    int   m_iqRenorm    = 0;       // counter for phasor renormalisation
 };
