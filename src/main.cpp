@@ -188,26 +188,40 @@ static void drawDisplay(bool first, float sig, time_t utc, const WwvTime& f,
     }
 
     // Line 4 — decoder detail: digit convergence + DST/leap
+    // Build a partial time string from the BCD accumulator.
+    // Fields: 0=min-tens, 1=min-units, 2=hr-tens, 3=hr-units,
+    //         4=day-hund, 5=day-tens, 6=day-units, 7=yr-tens, 8=yr-units
+    // Each digit is shown as its value when stable, '-' when not yet verified.
+    auto dchar = [](const WwvDecoder* dec, int fieldIdx) -> char {
+        if (!dec) return '-';
+        const DigitField& df = dec->digitField(fieldIdx);
+        if (df.value >= 0 && df.streak >= WwvDecoder::kMinStreak)
+            return (char)('0' + df.value);
+        return '-';
+    };
     int converged = g_decoder ? g_decoder->digitFieldsConverged() : 0;
+    // Format: "HH:MM  Day DDD  Year 20YY"
+    // Field order: hr-tens=2, hr-units=3, min-tens=0, min-units=1,
+    //              day-hundreds=4, day-tens=5, day-units=6,
+    //              year-tens=7, year-units=8
+    char partialBuf[32];
+    snprintf(partialBuf, sizeof(partialBuf), "%c%c:%c%c  Day %c%c%c  Year 20%c%c",
+             dchar(g_decoder, 2), dchar(g_decoder, 3),
+             dchar(g_decoder, 0), dchar(g_decoder, 1),
+             dchar(g_decoder, 4), dchar(g_decoder, 5), dchar(g_decoder, 6),
+             dchar(g_decoder, 7), dchar(g_decoder, 8));
     if (utc == 0) {
-        // Show field convergence progress during initial lock acquisition.
-        printf("Fields: ");
-        for (int i = 0; i < 9; ++i) {
-            // We can't easily get per-field state here, so show a simple bar.
-            if (i < converged) printf("\033[32m■\033[0m");
-            else               printf("\033[2m□\033[0m");
-        }
-        printf("  (%d/9 digit%s stable)\033[K\n",
-               converged, converged == 1 ? "" : "s");
+        printf("BCD: \033[1m%s\033[0m  (%d/9 stable)\033[K\n",
+               partialBuf, converged);
     } else {
-        // After lock: show DST, leap-second warning, digit convergence.
+        // After lock: show DST, leap-second warning, and partial BCD for confirmation.
         const char* dstStr = (f.dstCode == 0) ? "Standard time"
                            : (f.dstCode == 3) ? "DST in effect"
                            : (f.dstCode == 2) ? "DST begins today"
                            :                    "DST ends today";
         const char* lswStr = f.leapSecondWarning ? "  \033[33m⚠ Leap second\033[0m" : "";
-        printf("%s%s  Fields: %d/9 stable  [conf:%d]\033[K\n",
-               dstStr, lswStr, converged, f.confidence);
+        printf("%s%s  BCD: %s  [conf:%d]\033[K\n",
+               dstStr, lswStr, partialBuf, f.confidence);
     }
 
     fflush(stdout);
@@ -574,8 +588,16 @@ int main(int argc, char* argv[])
                 needNewline = false;
             } else if (utc == 0 && ++statusTick % kStatusEvery == 0) {
                 if (needNewline) { printf("\n"); needNewline = false; }
-                printf("-- Signal: %3.0f%%  Bits: %d --\n",
-                       sig * 100.0f, decoder.bitsReceived());
+                // Show partial BCD digits as they stabilize.
+                auto dc = [&](int fi) -> char {
+                    const DigitField& d = decoder.digitField(fi);
+                    return (d.value >= 0 && d.streak >= WwvDecoder::kMinStreak)
+                           ? (char)('0' + d.value) : '-';
+                };
+                printf("-- Signal: %3.0f%%  Bits: %3d  BCD: %c%c:%c%c  Day %c%c%c  Year 20%c%c --\n",
+                       sig * 100.0f, decoder.bitsReceived(),
+                       dc(2), dc(3), dc(0), dc(1),
+                       dc(4), dc(5), dc(6), dc(7), dc(8));
             }
         }
 
