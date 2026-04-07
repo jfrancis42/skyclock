@@ -760,8 +760,9 @@ bool WwvDecoder::decodeFrame(int startOffset)
     // we trust the decode and invoke the frame callback.
     auto currentP0 = ts(0);
     bool temporalOk = false;
+    double dt = 0.0;
     if (m_consecutiveGood > 0) {
-        double dt = std::chrono::duration<double>(currentP0 - m_prevP0Time).count();
+        dt = std::chrono::duration<double>(currentP0 - m_prevP0Time).count();
         // Accept ±2.5 s around the expected 60-second frame interval.
         temporalOk = (dt > 57.5 && dt < 62.5);
     }
@@ -784,7 +785,17 @@ bool WwvDecoder::decodeFrame(int startOffset)
     t.valid               = true;
     t.confidence          = m_consecutiveGood;
 
-    m_prevP0Time = currentP0;
+    // Only advance the P0 anchor when the timing is trustworthy:
+    //   • first decode ever (!m_p0Valid)
+    //   • temporal consistency confirmed (dt ≈ 60 s) — normal minute advance
+    //   • anchor is stale (dt > 65 s or negative) — signal came back after dropout
+    // Leaving the anchor fixed on small-dt failures (false-positive shifted
+    // frames with dt = 0..57 s) means the genuine 60 s gap at the real
+    // minute boundary is still measurable even after a string of false positives.
+    bool anchorStale = m_p0Valid && (dt < -5.0 || dt > 65.0);
+    if (!m_p0Valid || temporalOk || anchorStale) {
+        m_prevP0Time = currentP0;
+    }
     m_frame      = t;
     m_p0Time     = currentP0;
     m_p0Valid    = true;

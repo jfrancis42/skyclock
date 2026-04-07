@@ -91,6 +91,14 @@ public:
     // Range 0–9; useful as a "lock quality" indicator.
     int digitFieldsConverged() const;
 
+    // Returns per-digit state for field i (0–8):
+    //   0=minute-tens, 1=minute-units, 2=hour-tens, 3=hour-units,
+    //   4=day-hundreds, 5=day-tens, 6=day-units, 7=year-tens, 8=year-units
+    // df.value is the current winner (-1 before any frame), df.streak >= kBcdMinStreak
+    // means stable.  Caller may check stable with (df.streak >= WwvDecoder::kMinStreak).
+    const DigitField& digitField(int i) const { return m_digitFields[i]; }
+    static constexpr int kMinStreak = 3; // same as kBcdMinStreak
+
     // Instantaneous signal level, 0–1 based on 1 kHz tick SNR.
     float signalLevel() const { return m_signalLevel; }
 
