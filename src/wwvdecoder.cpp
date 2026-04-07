@@ -680,39 +680,29 @@ bool WwvDecoder::decodeFrame(int startOffset)
         }
     }
 
-    // ── Decode minutes ─────────────────────────────────────────────────────
+    // ── Decode BCD fields — validation before accumulator update ──────────
+    // All range checks run first; updateDigit() is called only after every
+    // check passes so the BCD accumulator never reflects rejected frames.
+
     int tens  = bval(1)*40 + bval(2)*20 + bval(3)*10;
     int units = bval(5)*8  + bval(6)*4  + bval(7)*2  + bval(8)*1;
     int minute = tens + units;
     if (minute < 0 || minute > 59) return false;
-    updateDigit(0, tens / 10);
-    updateDigit(1, units);
 
-    // ── Decode hours ───────────────────────────────────────────────────────
     int htens  = bval(12)*20 + bval(13)*10;
     int hunits = bval(15)*8  + bval(16)*4  + bval(17)*2 + bval(18)*1;
     int hour   = htens + hunits;
     if (hour < 0 || hour > 23) return false;
-    updateDigit(2, htens / 10);
-    updateDigit(3, hunits);
 
-    // ── Decode day of year ─────────────────────────────────────────────────
     int doy = bval(22)*200 + bval(23)*100
             + bval(25)*80  + bval(26)*40 + bval(27)*20 + bval(28)*10
             + bval(30)*8   + bval(31)*4  + bval(32)*2  + bval(33)*1;
     if (doy < 1 || doy > 366) return false;
-    updateDigit(4, (doy / 100));
-    updateDigit(5, (doy % 100) / 10);
-    updateDigit(6, doy % 10);
 
-    // ── Decode year (last 2 digits) ────────────────────────────────────────
     int ytens  = bval(45)*8 + bval(46)*4 + bval(47)*2 + bval(48)*1;
     int yunits = bval(50)*8 + bval(51)*4 + bval(52)*2 + bval(53)*1;
-    // Reject invalid BCD digits individually (each must be 0–9).
     if (ytens > 9 || yunits > 9) return false;
     int year2  = ytens * 10 + yunits;
-    updateDigit(7, ytens);
-    updateDigit(8, yunits);
 
     // ── Time plausibility gate ─────────────────────────────────────────────
     // Reject frames whose decoded UTC is more than 25 hours from the system
@@ -720,7 +710,6 @@ bool WwvDecoder::decodeFrame(int startOffset)
     // implausible dates (e.g. year 2001 when the system is in 2025).
     // Disable via setTimePlausibilityCheck(false) when replaying old recordings.
     if (m_timePlausibility) {
-        // Build a UTC unix timestamp from the decoded BCD fields.
         int fullYear = 2000 + year2;
         static const int days_norm[] = {31,28,31,30,31,30,31,31,30,31,30,31};
         static const int days_leap[] = {31,29,31,30,31,30,31,31,30,31,30,31};
@@ -743,6 +732,17 @@ bool WwvDecoder::decodeFrame(int startOffset)
                 > 25.0 * 3600.0)
             return false;
     }
+
+    // ── All structural checks passed — update BCD accumulators ────────────
+    updateDigit(0, tens / 10);
+    updateDigit(1, units);
+    updateDigit(2, htens / 10);
+    updateDigit(3, hunits);
+    updateDigit(4, (doy / 100));
+    updateDigit(5, (doy % 100) / 10);
+    updateDigit(6, doy % 10);
+    updateDigit(7, ytens);
+    updateDigit(8, yunits);
 
     // ── Decode UT1 correction ──────────────────────────────────────────────
     bool   ut1Positive = (bit(38) == BIT_ONE);
