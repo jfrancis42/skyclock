@@ -142,87 +142,26 @@ WwvDecoder::IQ WwvDecoder::goertzelComplex(const float* buf, int n,
 /* ── setIqOffset ─────────────────────────────────────────────────────────── */
 void WwvDecoder::setIqOffset(float offsetHz)
 {
-    m_iqOffset   = offsetHz;
-    float phase  = 2.0f * (float)M_PI * offsetHz / m_sampleRate;
-    m_iqCosStep  = cosf(phase);
-    m_iqSinStep  = sinf(phase);
-    m_iqCosState = 1.0f;
-    m_iqSinState = 0.0f;
-    m_iLpf1 = m_iLpf2 = m_qLpf1 = m_qLpf2 = 0.0f;
-    m_iqRenorm = 0;
+    m_iqOffset  = offsetHz;
+    // Shift Goertzel targets so they track the signal at its actual audio
+    // frequency rather than mixing it to baseband first.  The IQ mixing
+    // approach was found to fail for AM reception (carrier at offsetHz beats
+    // with the LO at exactly offsetHz, producing a constant tone at
+    // 2×offsetHz that lands in the 1 kHz tick bin and prevents rising-edge
+    // detection).  Running the Goertzels at the correct audio frequency
+    // avoids that entirely, and works equally well for SSB signals.
+    m_tickFreq = offsetHz + 1000.0f;
+    m_subFreq  = offsetHz +  100.0f;
 }
 
 /* ── pushSamples ─────────────────────────────────────────────────────────── */
 void WwvDecoder::pushSamples(const float* samples, int count)
 {
-    if (m_iqOffset > 0.0f) {
-        // ── I/Q envelope demodulation ─────────────────────────────────────
-        // Mix input with complex oscillator at m_iqOffset Hz, low-pass filter
-        // I and Q, then feed the envelope sqrt(I²+Q²) to the block processor.
-        //
-        // LPF: two cascaded single-pole IIRs, each with cutoff 1100 Hz.
-        // This gives ~7 dB additional rejection at 1500 Hz (the image of the
-        // 1 kHz tick shifted up by the offset) relative to a single stage.
-        //
-        //   α = 1 − exp(−2π × 1100 / sampleRate)
-        //
-        // The envelope contains:
-        //   • DC         — from the carrier (Goertzel ignores DC)
-        //   • 100 Hz     — from the BCD subcarrier at (offset+100) Hz in audio
-        //   • 1000 Hz    — from the 1 kHz tick at (offset+1000) Hz in audio
-        // Both match what the existing Goertzel detectors expect.
-        const float alpha = 1.0f - expf(-2.0f * (float)M_PI * 1100.0f / m_sampleRate);
-        const float beta  = 1.0f - alpha;
-
-        if ((int)m_iqEnvBuf.size() < count)
-            m_iqEnvBuf.resize(count);
-
-        for (int i = 0; i < count; ++i) {
-            // Advance complex phasor by one step (cos/sin rotation).
-            float nc = m_iqCosState * m_iqCosStep - m_iqSinState * m_iqSinStep;
-            float ns = m_iqCosState * m_iqSinStep + m_iqSinState * m_iqCosStep;
-            m_iqCosState = nc;
-            m_iqSinState = ns;
-
-            // Renormalise every 4096 samples to prevent rounding drift.
-            if (++m_iqRenorm >= 4096) {
-                m_iqRenorm = 0;
-                float mag = sqrtf(nc * nc + ns * ns);
-                if (mag > 1e-10f) {
-                    m_iqCosState /= mag;
-                    m_iqSinState /= mag;
-                }
-            }
-
-            // Mix
-            float x    = samples[i];
-            float iSig = x * m_iqCosState;
-            float qSig = x * m_iqSinState;
-
-            // Two-stage IIR LPF
-            m_iLpf1 = beta * m_iLpf1 + alpha * iSig;
-            m_iLpf2 = beta * m_iLpf2 + alpha * m_iLpf1;
-            m_qLpf1 = beta * m_qLpf1 + alpha * qSig;
-            m_qLpf2 = beta * m_qLpf2 + alpha * m_qLpf1;
-
-            // Use the I (in-phase) channel directly — NOT sqrt(I²+Q²).
-            // sqrt(I²+Q²) computes the amplitude envelope.  For a single tone
-            // at frequency f shifted to baseband, the envelope is constant DC;
-            // the Goertzel at f would see zero.  The I channel alone gives
-            // a×cos(2πft), which the Goertzel detects with normal power a²/4.
-            m_iqEnvBuf[i] = m_iLpf2;
-        }
-
-        // Feed envelope samples into the existing block processor.
-        for (int s = 0; s < count; ++s) {
-            m_blockBuf[m_blockBufFill++] = m_iqEnvBuf[s];
-            if (m_blockBufFill == m_blockSize) {
-                processBlock(m_blockBuf.data());
-                m_blockBufFill = 0;
-            }
-        }
-        return;
-    }
+    // IQ-offset mode: raw samples are fed directly to the block processor;
+    // m_tickFreq and m_subFreq are set to (offset + 1000 Hz) / (offset + 100 Hz)
+    // so that all Goertzel detectors look at the correct audio-band frequencies.
+    // No baseband mixing is done — that approach caused a constant (2×offset)-Hz
+    // beat from the AM carrier that prevented rising-edge tick detection.
 
     for (int s = 0; s < count; ++s) {
         m_blockBuf[m_blockBufFill++] = samples[s];
@@ -244,7 +183,8 @@ void WwvDecoder::processBlock(const float* block)
         std::chrono::milliseconds(static_cast<long long>(m_totalBlocks) * 10LL);
 
     // ── 1 kHz Goertzel — tick detection and signal-level display ─────────────
-    float p1k = goertzel(block, m_blockSize, 1000.0f, m_sampleRate);
+    // In IQ-offset mode m_tickFreq = offset + 1000 Hz; otherwise 1000 Hz.
+    float p1k = goertzel(block, m_blockSize, m_tickFreq, m_sampleRate);
 
     // Smooth 1 kHz power for noise floor tracking (fast α=0.5).
     m_smoothPower = 0.5f * p1k + 0.5f * m_smoothPower;
@@ -273,7 +213,8 @@ void WwvDecoder::processBlock(const float* block)
     }
 
     // ── 100 Hz Goertzel — raw power for accumulation ─────────────────────────
-    float p100 = goertzel(block, m_blockSize, 100.0f, m_sampleRate);
+    // In IQ-offset mode m_subFreq = offset + 100 Hz; otherwise 100 Hz.
+    float p100 = goertzel(block, m_blockSize, m_subFreq, m_sampleRate);
 
     // Track 100 Hz background for tick anti-spoof gate.
     // Update downward quickly when p100 is near floor; admit only a trickle
@@ -437,7 +378,7 @@ void WwvDecoder::processBlock(const float* block)
     // For broadband noise (variance σ²): E_noise ≈ σ² (window-length independent).
     // α = 0.1 → ~10 s settling time.
     if (bat == 98) {
-        float e_noise = goertzel(m_noiseRaw.data(), m_noiseFill, 100.0f, m_sampleRate);
+        float e_noise = goertzel(m_noiseRaw.data(), m_noiseFill, m_subFreq, m_sampleRate);
         float E_noise = (m_noiseFill > 0) ? e_noise * (float)m_noiseFill : 0.0f;
         const float noiseAlpha = 0.1f;
         m_noiseFloor100 = (1.0f - noiseAlpha) * m_noiseFloor100 + noiseAlpha * E_noise;
@@ -469,9 +410,9 @@ void WwvDecoder::onWindowClose(std::chrono::steady_clock::time_point tickTime)
     // This makes the fractions E_late/E_total, E_mid/E_total signal-ratio
     // quantities with the same thresholds as the old per-block approach while
     // providing ~20× better SNR from the narrower effective DFT bandwidth.
-    float e_early_g = goertzel(m_earlyRaw.data(), m_earlyFill, 100.0f, m_sampleRate);
-    float e_mid_g   = goertzel(m_midRaw.data(),   m_midFill,   100.0f, m_sampleRate);
-    float e_late_g  = goertzel(m_lateRaw.data(),  m_lateFill,  100.0f, m_sampleRate);
+    float e_early_g = goertzel(m_earlyRaw.data(), m_earlyFill, m_subFreq, m_sampleRate);
+    float e_mid_g   = goertzel(m_midRaw.data(),   m_midFill,   m_subFreq, m_sampleRate);
+    float e_late_g  = goertzel(m_lateRaw.data(),  m_lateFill,  m_subFreq, m_sampleRate);
 
     float E_early = e_early_g * (float)m_earlyFill;
     float E_mid   = e_mid_g   * (float)m_midFill;
@@ -489,7 +430,7 @@ void WwvDecoder::onWindowClose(std::chrono::steady_clock::time_point tickTime)
     // real signals on weak HF paths.  The coherence value is available for
     // future use (e.g. per-bit confidence scoring for the BCD accumulator).
     if (m_earlyFill > 0) {
-        IQ iq = goertzelComplex(m_earlyRaw.data(), m_earlyFill, 100.0f, m_sampleRate);
+        IQ iq = goertzelComplex(m_earlyRaw.data(), m_earlyFill, m_subFreq, m_sampleRate);
         float mag = sqrtf(iq.I * iq.I + iq.Q * iq.Q);
         // Update subcarrier phase EMA (slow — tracks ionospheric Doppler drift).
         const float kPhaseAlpha = 0.05f;
