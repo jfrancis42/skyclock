@@ -285,12 +285,14 @@ static time_t parseUtcTime(const char* str)
 #endif
 }
 
+static constexpr int kTickDisplayLines = 3;
+
 // Redraw the tick-sync 3-line status panel.
 static void drawTickDisplay(bool first, float sig, long long freqKhz,
                             const TickSnap& ts)
 {
     if (!first)
-        printf("\033[%dA\r", kDisplayLines);
+        printf("\033[%dA\r", kTickDisplayLines);
 
     float snrDb = (sig < 0.9999f) ? -10.0f * log10f(1.0f - sig) : 30.0f;
     printf("\033[1mskyclock " SC_VERSION "\033[0m   ");
@@ -387,6 +389,8 @@ static void printHelp(const char* argv0)
     printf("                         Omit seconds to use the system clock's second.\n");
     printf("  --full-decode          Full BCD time-code decode mode (requires a clean,\n");
     printf("                         low-noise signal and two consecutive clean minutes)\n");
+    printf("                         --== NOTE THAT THIS FUNCTION IS CURRENTLY BROKEN ==--\n");
+    printf("  --mode <mode>          Override radio mode from config (e.g. AM, USB, LSB, FM)\n");
     printf("  --iq-offset <hz>       I/Q envelope demodulation offset in Hz (default: 0).\n");
     printf("                         Use with a radio tuned <hz> below WWV in USB mode.\n");
     printf("                         Shifts the 100 Hz subcarrier and 1 kHz tick up by\n");
@@ -432,6 +436,7 @@ int main(int argc, char* argv[])
     int         rigctldPortArg  = 0;      // --rigctld-port <p>
     long long   freqKhzArg      = 0;      // --freq-khz <f>  (0 = use settings)
     float       iqOffsetHz      = 0.0f;   // --iq-offset <hz> (0 = disabled)
+    std::string modeArg;                  // --mode <mode>    (empty = use config)
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -462,6 +467,8 @@ int main(int argc, char* argv[])
             freqKhzArg = atoll(argv[++i]);
         } else if (!strcmp(argv[i], "--iq-offset") && i + 1 < argc) {
             iqOffsetHz = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+            modeArg = argv[++i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -700,7 +707,9 @@ int main(int argc, char* argv[])
     // (iqOffsetHz) below the WWV centre frequency so that the carrier appears
     // at iqOffsetHz in the audio passband.
     long long   tuneHz  = cfg.freqKhz * 1000LL - (long long)iqOffsetHz;
-    std::string tuneMode = (iqOffsetHz > 0.0f) ? "USB" : cfg.rigMode;
+    std::string tuneMode = !modeArg.empty() ? modeArg
+                         : (iqOffsetHz > 0.0f) ? "USB"
+                         : cfg.rigMode;
 
     printf("Config: %s\n", cfg.path().c_str());
     if (iqOffsetHz > 0.0f) {
@@ -954,8 +963,21 @@ int main(int argc, char* argv[])
                                        std::chrono::system_clock::duration>(elapsed);
                     std::string clockErr;
                     if (setSystemClock(utcNow, clockErr)) {
-                        std::lock_guard<std::mutex> lk(g_tickMutex);
-                        g_tickSnap.clockSet = true;
+                        {
+                            std::lock_guard<std::mutex> lk(g_tickMutex);
+                            g_tickSnap.clockSet = true;
+                        }
+                        // Redraw once to show LOCKED, then exit.
+                        TickSnap tsFinal;
+                        {
+                            std::lock_guard<std::mutex> lk(g_tickMutex);
+                            tsFinal = g_tickSnap;
+                        }
+                        g_smoothSig = 0.94f * g_smoothSig + 0.06f * decoder.signalLevel();
+                        drawTickDisplay(false, g_smoothSig, cfg.freqKhz, tsFinal);
+                        printf("\n");
+                        g_running.store(false);
+                        break;
                     } else {
                         fprintf(stderr, "\nClock sync failed: %s\n", clockErr.c_str());
                     }
