@@ -943,6 +943,35 @@ int main(int argc, char* argv[])
                 }
             }
 
+            // Prediction-based boundary fallback: if ≥3 ticks have been seen
+            // but the exact :00 tick was missed (signal fade), fire the clock
+            // set once the predicted minute boundary has passed by 500 ms.
+            // The 500 ms grace period lets a real :00 tick arrive first (more
+            // accurate); only the prediction fires if it doesn't come.
+            {
+                std::lock_guard<std::mutex> lk(g_tickMutex);
+                TickSnap& ts = g_tickSnap;
+                if (ts.tickCount >= 3 && !ts.boundaryFound && ts.hasAnchor) {
+                    int secsIn   = static_cast<int>(ts.lastTickUtc % 60);
+                    int secsLeft = (secsIn == 0) ? 60 : (60 - secsIn);
+                    auto predBoundary = ts.lastTick +
+                                        std::chrono::seconds(secsLeft);
+                    // Only act on a recent-enough tick (≤30 s old at boundary)
+                    // to keep the UTC estimate valid.
+                    auto tickAge = predBoundary - ts.lastTick;
+                    if (tickAge <= std::chrono::seconds(30) &&
+                        std::chrono::steady_clock::now() >=
+                            predBoundary + std::chrono::milliseconds(500)) {
+                        ts.boundaryFound = true;
+                        ts.boundaryUtc   = ts.lastTickUtc + secsLeft;
+                        ts.boundaryUtc  -= ts.boundaryUtc % 60;
+                        ts.pendingTick   = predBoundary;
+                        ts.pendingSet    = true;
+                        ts.pendingUtc    = ts.boundaryUtc;
+                    }
+                }
+            }
+
             float sig = decoder.signalLevel();
             g_smoothSig = 0.94f * g_smoothSig + 0.06f * sig;
 
